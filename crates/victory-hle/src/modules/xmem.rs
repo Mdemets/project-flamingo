@@ -395,6 +395,11 @@ struct Physical {
     views: BTreeMap<usize, (usize, Slice)>,
     /// Section handle, slice index and guest address for each mapped page.
     aliases: BTreeSet<(usize, usize, usize)>,
+    /// Address ranges ever mapped, start to end, coalesced: what a read may
+    /// race (a remap takes a view down and puts the next one up, and a title
+    /// thread that faults in that window reads again instead of dying, as on
+    /// the console, where the pages of a mapping are always readable).
+    windows: BTreeMap<usize, usize>,
 }
 
 impl Physical {
@@ -416,6 +421,38 @@ impl Physical {
         self.aliases
             .range((handle, first, 0)..(handle, end, 0))
             .map(|entry| entry.2)
+    }
+
+    /// Notes that `[base, base + len)` is a range the title maps pages at,
+    /// joining it with the ranges noted before.
+    fn note(&mut self, base: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let end = base + len;
+        // Join with the ranges that touch it, then insert the hull.
+        let first = self
+            .windows
+            .range(..base)
+            .next_back()
+            .filter(|(_, stop)| **stop >= base)
+            .map(|(start, _)| *start);
+        let start = first.unwrap_or(base);
+        let stop = self
+            .windows
+            .range(base..=end)
+            .next_back()
+            .map_or(end, |(_, stop)| (*stop).max(end));
+        self.windows.retain(|s, e| *s < start || *e > stop);
+        self.windows.insert(start, stop);
+    }
+
+    /// Whether `at` lies in a range the title maps pages at.
+    fn raced(&self, at: usize) -> bool {
+        self.windows
+            .range(..=at)
+            .next_back()
+            .is_some_and(|(start, stop)| at >= *start && at < *stop)
     }
 
     fn allocate(&mut self, section: Arc<Section>, numbers: &mut [MaybeUninit<usize>]) -> bool {
@@ -460,6 +497,65 @@ fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Takes faults whose address lies in a range the title maps pages at
+/// ([`PHYSICAL`]'s windows), waits for the mapping to be back, and resumes
+/// the access. A remap takes a view down and puts the next one up, and on
+/// the console the pages of a mapping are readable throughout: a title
+/// thread that reads while another remaps sees the old or the new page, it
+/// does not die. Our map and unmap are two host calls, so a racing read
+/// faults in between; a page that never comes back (a map failed) is a
+/// crash like before, after a moment's wait.
+fn install_rescue() {
+    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+        EXCEPTION_POINTERS,
+    };
+    unsafe extern "system" fn on_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // SAFETY: the system passes the exception being dispatched.
+        let r = unsafe { &*(*info).ExceptionRecord };
+        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let at = r.ExceptionInformation[1];
+        // Without the lock: a write over the map is brief and does not wait
+        // on this thread, so a read never deadlocks, and our own mapping code
+        // never reads the pages it maps.
+        if !physical().raced(at) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if committed(at) {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            if std::time::Instant::now() >= deadline {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: the handler only reads our own bookkeeping and queries memory.
+    ONCE.call_once(|| unsafe {
+        AddVectoredExceptionHandler(1, Some(on_fault));
+    });
+}
+
+/// Whether `at` is committed readable memory now.
+fn committed(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READONLY, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0
+        && info.State == MEM_COMMIT
+        && !matches!(info.Protect & 0xff, PAGE_NOACCESS | PAGE_READONLY)
+}
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
@@ -479,6 +575,8 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         unsafe { count.write(0) };
         return 0;
     }
+    // Ahead of the first map, so a racing read never crashes the process.
+    install_rescue();
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): the title asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
@@ -679,6 +777,7 @@ pub extern "system" fn XMemMapPhysicalPages(
 ) -> *mut c_void {
     let base = address as usize;
     let mut physical = physical();
+    physical.note(base, n * PAGE);
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
         return address;
@@ -796,6 +895,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
+    physical.note(to, len);
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -1150,6 +1250,30 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remap_windows_coalesce_and_contain() {
+        let mut p = Physical::default();
+        p.note(0x1_0000, 0x1_0000);
+        p.note(0x3_0000, 0x1_0000);
+        // Disjoint ranges stay apart; only their interior is raced.
+        assert!(p.raced(0x1_0000));
+        assert!(p.raced(0x1_FFFF));
+        assert!(!p.raced(0x2_0000));
+        assert!(p.raced(0x3_8000));
+        // A range touching another joins it.
+        p.note(0x2_0000, 0x1_0000);
+        assert!(p.raced(0x2_0000));
+        assert_eq!(p.windows.len(), 1);
+        assert_eq!(p.windows.get(&0x1_0000), Some(&0x4_0000));
+        // An old range covered whole by a new one goes away.
+        let mut p = Physical::default();
+        p.note(0x1_0000, 0x1_0000);
+        p.note(0x1_0000, 0x2_0000);
+        assert_eq!(p.windows.len(), 1);
+        assert_eq!(p.windows.get(&0x1_0000), Some(&0x3_0000));
+        assert!(!p.raced(0x3_0000));
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
