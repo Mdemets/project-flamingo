@@ -83,6 +83,107 @@ impl Swizzle {
     pub fn xor(self) -> bool {
         self.0 >= 16
     }
+
+    /// Render-target optimized modes (`_R`, `_R_X`): addrlib's
+    /// `IsRtOptSwizzle`.
+    fn rt_opt(self) -> bool {
+        matches!(self.0, 3 | 7 | 11 | 23 | 27)
+    }
+}
+
+/// The GPU's pipeline configuration, which compression metadata block sizes
+/// depend on (addrlib's `Gfx10Lib` reads it from registers, not from a
+/// texture description).
+///
+/// Series X and Series S do not share one, so a caller that does not know
+/// the values for its chip must not ask for metadata planes: a wrong block
+/// size would disagree with the console's own tables, and a title that keeps
+/// those sizes (Grand Theft Auto VI does) asserts when they do not match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetaConfig {
+    /// log2 of the number of shader pipes (`m_pipesLog2`).
+    pub pipes_log2: u32,
+    /// log2 of the pipe interleave size in bytes (`m_pipeInterleaveLog2`).
+    pub pipe_interleave_log2: u32,
+    /// log2 of the number of shader arrays (`m_numSaLog2`).
+    pub num_sa_log2: u32,
+    /// log2 of the largest compression fragment (`m_maxCompFragLog2`).
+    pub max_comp_frag_log2: u32,
+    /// Whether the chip combines the render backends (`supportRbPlus`).
+    pub rb_plus: bool,
+}
+
+impl std::fmt::Display for MetaConfig {
+    /// The form [`MetaConfig::parse`] reads back.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "pipes={},interleave={},sa={},maxfrag={},rb+={}",
+            self.pipes_log2,
+            self.pipe_interleave_log2,
+            self.num_sa_log2,
+            self.max_comp_frag_log2,
+            u8::from(self.rb_plus)
+        )
+    }
+}
+
+impl MetaConfig {
+    /// The chip's configuration from a `key=value` list, as on a command
+    /// line: `pipes=2,interleave=8,sa=1,maxfrag=3,rb+=1`.
+    ///
+    /// Keys: `pipes` (`m_pipesLog2`), `interleave`
+    /// (`m_pipeInterleaveLog2`), `sa` (`m_numSaLog2`), `maxfrag`
+    /// (`m_maxCompFragLog2`) and `rb+` (`supportRbPlus`, `1` or `0`).
+    /// All five are required and none may repeat, so a typo cannot fall back
+    /// to another chip's block sizes: the caller gets `None` and keeps
+    /// metadata off.
+    pub fn parse(text: &str) -> Option<MetaConfig> {
+        let mut pipes_log2 = None;
+        let mut pipe_interleave_log2 = None;
+        let mut num_sa_log2 = None;
+        let mut max_comp_frag_log2 = None;
+        let mut rb_plus = None;
+        for field in text.split(',') {
+            let (key, value) = field.split_once('=')?;
+            let value = value.trim();
+            let slot = match key.trim() {
+                "pipes" => &mut pipes_log2,
+                "interleave" => &mut pipe_interleave_log2,
+                "sa" => &mut num_sa_log2,
+                "maxfrag" => &mut max_comp_frag_log2,
+                "rb+" | "rb_plus" => {
+                    if rb_plus.is_some() {
+                        return None;
+                    }
+                    rb_plus = Some(match value {
+                        "1" | "true" | "yes" => true,
+                        "0" | "false" | "no" => false,
+                        _ => return None,
+                    });
+                    continue;
+                }
+                _ => return None,
+            };
+            if slot.is_some() {
+                return None;
+            }
+            *slot = Some(value.parse().ok()?);
+        }
+        let config = MetaConfig {
+            pipes_log2: pipes_log2?,
+            pipe_interleave_log2: pipe_interleave_log2?,
+            num_sa_log2: num_sa_log2?,
+            max_comp_frag_log2: max_comp_frag_log2?,
+            rb_plus: rb_plus?,
+        };
+        // addrlib's GFX10 ranges; outside them is a mistake, not a chip.
+        let sane = (1..=4).contains(&config.pipes_log2)
+            && config.pipe_interleave_log2 <= 12
+            && config.num_sa_log2 <= 2
+            && config.max_comp_frag_log2 <= 4;
+        sane.then_some(config)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -904,13 +1005,50 @@ pub struct Plane {
     pub layout: Layout,
 }
 
-/// Every data plane of a texture (depth, then stencil), placed one after
-/// the other. `size` covers the data planes only: the host GPU has no use
-/// for the console's compression metadata, and [`metadata`] sizes that
-/// memory separately for callers that reserve console-sized pools.
+/// What a metadata plane compresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataKind {
+    /// Depth/stencil compression (HTILE), for a 32-bit depth buffer.
+    Htile,
+    /// Color compression (DCC), for a render target.
+    Dcc,
+}
+
+/// One compression metadata plane, placed after the data planes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataPlane {
+    /// From the start of the texture.
+    pub offset: u64,
+    pub kind: MetadataKind,
+    pub size: u64,
+    pub alignment: u64,
+    /// Bytes per metadata row and the number of rows; the console programs
+    /// both into the metadata registers.
+    pub pitch: u32,
+    pub height: u32,
+}
+
+/// Which metadata planes to add to a texture, when its description can
+/// carry them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MetadataRequest {
+    pub htile: bool,
+    pub dcc: bool,
+}
+
+/// Every plane of a texture: the data planes (depth, then stencil), then
+/// the compression metadata planes the caller asked for.
+///
+/// shortcut: [`Texture::new`] adds no compression metadata (HTILE, CMASK,
+/// FMASK, DCC); the console adds them to render targets and depth buffers
+/// unless the description denies them, so those are smaller here than on
+/// the console. [`Texture::with_metadata`] adds HTILE and DCC when the
+/// caller knows the chip's [`MetaConfig`]; [`metadata`] stays the coarse
+/// upper bound for callers that only reserve pool room.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Texture {
     pub planes: Vec<Plane>,
+    pub metadata: Vec<MetadataPlane>,
     pub size: u64,
     pub alignment: u64,
 }
@@ -944,6 +1082,27 @@ pub fn metadata(desc: &TextureDesc, texture: &Texture, depth: bool, render: bool
 
 impl Texture {
     pub fn new(desc: &TextureDesc) -> Result<Texture, Error> {
+        Texture::build(desc, None)
+    }
+
+    /// The data planes plus the compression metadata planes of `request`.
+    ///
+    /// A request the description cannot carry (DCC on a depth buffer, HTILE
+    /// on a color target, a mip chain, a linear layout) adds nothing. The
+    /// sizes come from addrlib's `Gfx10Lib` metadata functions, parameterized
+    /// by `config`; see [`MetaConfig`] for why the caller must know it.
+    pub fn with_metadata(
+        desc: &TextureDesc,
+        config: &MetaConfig,
+        request: MetadataRequest,
+    ) -> Result<Texture, Error> {
+        Texture::build(desc, Some((config, request)))
+    }
+
+    fn build(
+        desc: &TextureDesc,
+        meta: Option<(&MetaConfig, MetadataRequest)>,
+    ) -> Result<Texture, Error> {
         let f = format(desc.format).ok_or(Error::Invalid)?;
         let depth3d = if desc.dimension == Dimension::Tex3d {
             desc.depth_or_array
@@ -987,14 +1146,234 @@ impl Texture {
             });
         }
         let last = &planes[planes.len() - 1];
-        let size = last.offset + last.layout.size;
-        let alignment = planes.iter().map(|p| p.layout.alignment).max().unwrap_or(1);
+        let mut size = last.offset + last.layout.size;
+        let mut alignment = planes.iter().map(|p| p.layout.alignment).max().unwrap_or(1);
+        let mut metadata = Vec::new();
+        if let Some((config, request)) = meta {
+            let d = planes[0].layout.desc;
+            if request.htile {
+                place(&mut metadata, &mut size, &mut alignment, htile(&d, config));
+            }
+            if request.dcc {
+                place(&mut metadata, &mut size, &mut alignment, dcc(&d, config));
+            }
+        }
         Ok(Texture {
             planes,
+            metadata,
             size,
             alignment,
         })
     }
+}
+
+/// Append `plane` after the planes placed so far, aligned to its own
+/// alignment (the console places metadata after the data).
+fn place(
+    metadata: &mut Vec<MetadataPlane>,
+    size: &mut u64,
+    alignment: &mut u64,
+    plane: Option<MetadataPlane>,
+) {
+    if let Some(p) = plane {
+        let offset = size.next_multiple_of(p.alignment);
+        metadata.push(MetadataPlane { offset, ..p });
+        *size = offset + p.size;
+        *alignment = (*alignment).max(p.alignment);
+    }
+}
+
+/// Which element a metadata block covers; addrlib's `Gfx10DataType`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MetaData {
+    Color,
+    Depth,
+}
+
+/// A metadata block: its size and the data block it covers.
+struct MetaBlock {
+    size: u32,
+    w: u32,
+    h: u32,
+}
+
+/// `GetBlk256SizeLog2`: log2 texels of the 256-byte micro block.
+fn micro_block(elem_log2: u32, samples_log2: u32) -> (i32, i32) {
+    let mut bits = 8 - elem_log2 as i32;
+    if samples_log2 > 0 {
+        bits -= samples_log2 as i32;
+    }
+    ((bits >> 1) + (bits & 1), bits >> 1)
+}
+
+/// `GetEffectiveNumPipes`.
+fn effective_pipes(c: &MetaConfig) -> i32 {
+    if c.rb_plus && c.num_sa_log2 + 1 >= c.pipes_log2 {
+        c.pipes_log2 as i32
+    } else {
+        c.num_sa_log2 as i32 + 1
+    }
+}
+
+/// `GetPipeRotateAmount`; `IsRbAligned` asks for a render-target mode on a
+/// 2D resource, and every caller here is one.
+fn pipe_rotate(c: &MetaConfig, swizzle: Swizzle) -> i32 {
+    if c.rb_plus && c.pipes_log2 > c.num_sa_log2 && c.pipes_log2 > 1 {
+        if c.pipes_log2 == c.num_sa_log2 + 1 && swizzle.rt_opt() {
+            1
+        } else {
+            c.pipes_log2 as i32 - (c.num_sa_log2 as i32 + 1)
+        }
+    } else {
+        0
+    }
+}
+
+/// `GetMetaOverlapLog2`.
+fn meta_overlap(c: &MetaConfig, data: MetaData, elem_log2: u32, samples_log2: u32) -> i32 {
+    let (w, h) = micro_block(elem_log2, samples_log2);
+    let micro = w + h;
+    let comp = if data == MetaData::Color { micro } else { 6 };
+    let pipes = effective_pipes(c);
+    let mut overlap = pipes - comp.max(micro);
+    if pipes > 1 && c.rb_plus {
+        overlap += 1;
+    }
+    if elem_log2 == 4 && samples_log2 == 3 {
+        overlap -= 1;
+    }
+    overlap.max(0)
+}
+
+/// `GetMetaBlkSize` for a thin 2D resource with `pipeAlign`: the metadata
+/// block size and the block of data it covers.
+fn meta_block(
+    c: &MetaConfig,
+    data: MetaData,
+    swizzle: Swizzle,
+    elem_log2: u32,
+    samples_log2: u32,
+) -> Option<MetaBlock> {
+    let data_blk = swizzle.block_log2()?;
+    if data_blk == 0 {
+        return None;
+    }
+    let meta_elem: i32 = if data == MetaData::Color { 0 } else { 2 };
+    let meta_cache: i32 = if data == MetaData::Color { 6 } else { 8 };
+    let comp_blk: i32 = if data == MetaData::Color {
+        8
+    } else {
+        6 + samples_log2 as i32 + elem_log2 as i32
+    };
+    let meta_samples: i32 = if data == MetaData::Depth {
+        samples_log2 as i32
+    } else {
+        samples_log2.min(c.max_comp_frag_log2) as i32
+    };
+    let mut pipes = c.pipes_log2 as i32;
+    let metablk: i32 = if swizzle.standard() || swizzle.display() {
+        (c.pipe_interleave_log2 as i32 + pipes)
+            .max(12)
+            .min(data_blk as i32)
+    } else {
+        if c.rb_plus && c.pipes_log2 == c.num_sa_log2 + 1 && c.pipes_log2 > 1 {
+            pipes += 1;
+        }
+        let rotate = pipe_rotate(c, swizzle);
+        let mut size = if pipes >= 4 {
+            let mut overlap = meta_overlap(c, data, elem_log2, samples_log2);
+            if rotate > 0
+                && elem_log2 == 4
+                && samples_log2 == 3
+                && (swizzle.z_order() || effective_pipes(c) > 3)
+            {
+                overlap += 1;
+            }
+            let mut size = meta_cache + overlap + pipes;
+            size = size.max(c.pipe_interleave_log2 as i32 + pipes);
+            if c.rb_plus
+                && swizzle.rt_opt()
+                && pipes == 6
+                && samples_log2 == 3
+                && c.max_comp_frag_log2 == 3
+                && size < 15
+            {
+                size = 15;
+            }
+            size
+        } else {
+            (c.pipe_interleave_log2 as i32 + pipes).max(12)
+        };
+        if data == MetaData::Depth {
+            size = size.max(11 + pipes);
+        }
+        let comp_frag = c.max_comp_frag_log2.min(samples_log2) as i32;
+        if swizzle.rt_opt() && comp_frag > 1 && rotate >= 1 {
+            size = size.max(8 + c.pipes_log2 as i32 + rotate.max(comp_frag - 1));
+        }
+        size
+    };
+    let bits = metablk + comp_blk - elem_log2 as i32 - meta_samples - meta_elem;
+    if !(0..31).contains(&bits) || !(8..=31).contains(&metablk) {
+        return None;
+    }
+    Some(MetaBlock {
+        size: 1u32 << metablk,
+        w: 1u32 << ((bits >> 1) + (bits & 1)),
+        h: 1u32 << (bits >> 1),
+    })
+}
+
+/// `HwlComputeHtileInfo`: HTILE for a 32-bit, single-sampled, one-mip depth
+/// buffer in `SW_64KB_Z_X`.
+fn htile(d: &Desc, c: &MetaConfig) -> Option<MetadataPlane> {
+    if d.dimension != Dimension::Tex2d
+        || d.swizzle != Swizzle::SW_64KB_Z_X
+        || d.element_bytes != 4
+        || d.samples != 1
+        || d.mips != 1
+        || d.block != 1
+    {
+        return None;
+    }
+    let block = meta_block(c, MetaData::Depth, d.swizzle, 2, 0)?;
+    let pitch = d.width.next_multiple_of(block.w);
+    let height = d.height.next_multiple_of(block.h);
+    let base = block.size.max(1u32.checked_shl(c.pipes_log2 + 11).unwrap_or(u32::MAX));
+    let blocks = (pitch / block.w).checked_mul(height / block.h)?;
+    let slice = u64::from(blocks).checked_mul(u64::from(block.size))?;
+    let size = slice.checked_mul(u64::from(d.depth.max(1)))?;
+    Some(MetadataPlane {
+        offset: 0,
+        kind: MetadataKind::Htile,
+        size,
+        alignment: u64::from(base),
+        pitch,
+        height,
+    })
+}
+
+/// `HwlComputeDccInfo`: DCC for a one-mip render target in an `_R` mode.
+fn dcc(d: &Desc, c: &MetaConfig) -> Option<MetadataPlane> {
+    if d.dimension != Dimension::Tex2d || !d.swizzle.rt_opt() || d.block != 1 || d.mips != 1 {
+        return None;
+    }
+    let elem_log2 = d.element_bytes.trailing_zeros();
+    let samples_log2 = d.samples.trailing_zeros();
+    let block = meta_block(c, MetaData::Color, d.swizzle, elem_log2, samples_log2)?;
+    let pitch = d.width.next_multiple_of(block.w);
+    let height = d.height.next_multiple_of(block.h);
+    let blocks = (pitch / block.w).checked_mul(height / block.h)?;
+    let slice = u64::from(blocks).checked_mul(u64::from(block.size))?;
+    let size = slice.checked_mul(u64::from(d.depth.max(1)))?;
+    Some(MetadataPlane {
+        offset: 0,
+        kind: MetadataKind::Dcc,
+        size,
+        alignment: u64::from(block.size),
+        pitch,
+        height,
+    })
 }
 
 #[cfg(test)]
@@ -1093,6 +1472,7 @@ mod tests {
         let huge = texture_desc(&desc(u32::MAX, 1, 1, 4, Swizzle::SW_64KB_R_X));
         let fake = Texture {
             planes: Vec::new(),
+            metadata: Vec::new(),
             size: u64::MAX,
             alignment: 1,
         };
@@ -1609,5 +1989,246 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    fn series_x() -> MetaConfig {
+        MetaConfig {
+            pipes_log2: 2,
+            pipe_interleave_log2: 8,
+            num_sa_log2: 1,
+            max_comp_frag_log2: 3,
+            rb_plus: true,
+        }
+    }
+
+    fn color(w: u32, h: u32, samples: u32) -> TextureDesc {
+        TextureDesc {
+            dimension: Dimension::Tex2d,
+            width: w,
+            height: h,
+            depth_or_array: 1,
+            mips: 1,
+            format: 28,
+            samples,
+            swizzle: Swizzle::SW_64KB_R_X,
+        }
+    }
+
+    #[test]
+    fn metadata_is_off_by_default() {
+        let d = color(1920, 1080, 1);
+        let plain = Texture::new(&d).unwrap();
+        assert!(plain.metadata.is_empty());
+        let with = Texture::with_metadata(
+            &d,
+            &series_x(),
+            MetadataRequest {
+                htile: false,
+                dcc: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(with.planes, plain.planes);
+        assert_eq!(with.metadata.len(), 1);
+        assert!(with.size > plain.size);
+    }
+
+    #[test]
+    fn dcc_matches_addrlib() {
+        // 1920x1080 RGBA8 in 64 KiB render-target mode. With two pipes, one
+        // shader array and RB+, a 4 KiB block covers 512x512 texels, so the
+        // 2048x1536 metadata is 12 blocks.
+        let t = Texture::with_metadata(
+            &color(1920, 1080, 1),
+            &series_x(),
+            MetadataRequest {
+                htile: false,
+                dcc: true,
+            },
+        )
+        .unwrap();
+        let m = t.metadata[0];
+        assert_eq!(m.kind, MetadataKind::Dcc);
+        assert_eq!((m.pitch, m.height), (2048, 1536));
+        assert_eq!(m.size, 12 * 4096);
+        assert_eq!(m.alignment, 4096);
+        assert_eq!(m.offset, t.planes[0].layout.size.next_multiple_of(4096));
+        assert_eq!(t.size, m.offset + m.size);
+    }
+
+    #[test]
+    fn htile_matches_addrlib() {
+        // 3840x2160 D32 in SW_64KB_Z_X: 16 KiB blocks covering 512x512, 8x5
+        // of them, and the base alignment is max(16 KiB, 2^(2+11)).
+        let d = TextureDesc {
+            swizzle: Swizzle::SW_64KB_Z_X,
+            format: 40,
+            ..color(3840, 2160, 1)
+        };
+        let t = Texture::with_metadata(
+            &d,
+            &series_x(),
+            MetadataRequest {
+                htile: true,
+                dcc: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(t.metadata.len(), 1, "DCC must not be added to depth");
+        let m = t.metadata[0];
+        assert_eq!(m.kind, MetadataKind::Htile);
+        assert_eq!((m.pitch, m.height), (4096, 2560));
+        assert_eq!(m.size, 8 * 5 * 16384);
+        assert_eq!(m.alignment, 16384);
+    }
+
+    #[test]
+    fn dcc_of_msaa_uses_the_compression_fragment() {
+        // 4x MSAA halves the block: 256x256 texels per 4 KiB.
+        let t = Texture::with_metadata(
+            &color(1920, 1080, 4),
+            &series_x(),
+            MetadataRequest {
+                htile: false,
+                dcc: true,
+            },
+        )
+        .unwrap();
+        let m = t.metadata[0];
+        assert_eq!((m.pitch, m.height), (2048, 1280));
+        assert_eq!(m.size, 8 * 5 * 4096);
+    }
+
+    #[test]
+    fn metadata_is_skipped_when_it_does_not_apply() {
+        // DCC on a depth buffer.
+        let depth = TextureDesc {
+            swizzle: Swizzle::SW_64KB_Z_X,
+            format: 40,
+            ..color(1920, 1080, 1)
+        };
+        let t = Texture::with_metadata(
+            &depth,
+            &series_x(),
+            MetadataRequest {
+                htile: false,
+                dcc: true,
+            },
+        )
+        .unwrap();
+        assert!(t.metadata.is_empty());
+
+        // A mip chain: addrlib's mip-tail placement is not ported yet.
+        let mips = TextureDesc {
+            mips: 2,
+            ..color(64, 64, 1)
+        };
+        let t = Texture::with_metadata(
+            &mips,
+            &series_x(),
+            MetadataRequest {
+                htile: false,
+                dcc: true,
+            },
+        )
+        .unwrap();
+        assert!(t.metadata.is_empty());
+
+        // A linear layout has no blocks.
+        let linear = TextureDesc {
+            swizzle: Swizzle::LINEAR,
+            ..color(64, 64, 1)
+        };
+        let t = Texture::with_metadata(
+            &linear,
+            &series_x(),
+            MetadataRequest {
+                htile: true,
+                dcc: true,
+            },
+        )
+        .unwrap();
+        assert!(t.metadata.is_empty());
+    }
+
+    #[test]
+    fn htile_covers_every_array_slice_and_follows_the_data() {
+        let one = TextureDesc {
+            depth_or_array: 1,
+            swizzle: Swizzle::SW_64KB_Z_X,
+            format: 40,
+            ..color(1024, 1024, 1)
+        };
+        let six = TextureDesc {
+            depth_or_array: 6,
+            ..one
+        };
+        let request = MetadataRequest {
+            htile: true,
+            dcc: false,
+        };
+        let single = Texture::with_metadata(&one, &series_x(), request).unwrap();
+        let array = Texture::with_metadata(&six, &series_x(), request).unwrap();
+        let (data_end, m) = (&array.planes, array.metadata[0]);
+        let data_end = data_end
+            .iter()
+            .map(|p| p.offset + p.layout.size)
+            .max()
+            .unwrap();
+        // After the data, on its own alignment, and the size covers it.
+        assert!(m.offset >= data_end);
+        assert_eq!(m.offset % m.alignment, 0);
+        assert_eq!(array.size, m.offset + m.size);
+        // One metadata plane per slice.
+        assert_eq!(m.size, 6 * single.metadata[0].size);
+    }
+
+    #[test]
+    fn meta_config_parses_and_prints() {
+        let series_x = series_x();
+        assert_eq!(MetaConfig::parse(&series_x.to_string()), Some(series_x));
+        assert_eq!(
+            MetaConfig::parse("pipes=2,interleave=8,sa=1,maxfrag=3,rb+=1"),
+            Some(series_x)
+        );
+        assert_eq!(
+            MetaConfig::parse(" pipes = 2 , interleave = 8 , sa = 1 , maxfrag = 3 , rb+ = true "),
+            Some(series_x)
+        );
+    }
+
+    #[test]
+    fn a_malformed_meta_config_is_rejected() {
+        for text in [
+            "",
+            "pipes=2",
+            "pipes=2,interleave=8,sa=1,maxfrag=3",
+            "pipes=2,pipes=2,interleave=8,sa=1,maxfrag=3,rb+=1",
+            "pipes=2,interleave=8,sa=1,maxfrag=3,rb+=1,extra=0",
+            "pipes=2,interleave=8,sa=1,maxfrag=3,rb+=2",
+            "pipes=0,interleave=8,sa=1,maxfrag=3,rb+=1",
+            "pipes=5,interleave=8,sa=1,maxfrag=3,rb+=1",
+            "pipes=2,interleave=13,sa=1,maxfrag=3,rb+=1",
+            "pipes=2,interleave=8,sa=3,maxfrag=3,rb+=1",
+            "pipes=2,interleave=8,sa=1,maxfrag=5,rb+=1",
+            "pipes=two,interleave=8,sa=1,maxfrag=3,rb+=1",
+            "pipes=2,interleave=8,sa=1,maxfrag=3,rb+=1,sa=2",
+        ] {
+            assert_eq!(MetaConfig::parse(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_parsed_config_sizes_like_a_constructed_one() {
+        let parsed = MetaConfig::parse("pipes=2,interleave=8,sa=1,maxfrag=3,rb+=1").unwrap();
+        let request = MetadataRequest {
+            htile: true,
+            dcc: true,
+        };
+        let d = color(1920, 1080, 1);
+        assert_eq!(
+            Texture::with_metadata(&d, &parsed, request).unwrap(),
+            Texture::with_metadata(&d, &series_x(), request).unwrap()
+        );
     }
 }
