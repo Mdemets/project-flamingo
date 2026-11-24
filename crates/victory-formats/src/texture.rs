@@ -1339,7 +1339,9 @@ fn htile(d: &Desc, c: &MetaConfig) -> Option<MetadataPlane> {
     let block = meta_block(c, MetaData::Depth, d.swizzle, 2, 0)?;
     let pitch = d.width.next_multiple_of(block.w);
     let height = d.height.next_multiple_of(block.h);
-    let base = block.size.max(1u32.checked_shl(c.pipes_log2 + 11).unwrap_or(u32::MAX));
+    let base = block
+        .size
+        .max(1u32.checked_shl(c.pipes_log2 + 11).unwrap_or(u32::MAX));
     let blocks = (pitch / block.w).checked_mul(height / block.h)?;
     let slice = u64::from(blocks).checked_mul(u64::from(block.size))?;
     let size = slice.checked_mul(u64::from(d.depth.max(1)))?;
