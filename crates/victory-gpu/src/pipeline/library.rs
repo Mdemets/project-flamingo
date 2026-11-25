@@ -41,6 +41,8 @@ pub fn use_pipeline_cache(dir: PathBuf) {
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
+/// Library loads the host refused, since the start.
+pub(crate) static LOAD_REFUSED: AtomicU64 = AtomicU64::new(0);
 
 struct Library {
     library: ID3D12PipelineLibrary1,
@@ -232,6 +234,14 @@ pub(crate) fn pipeline(
         LOADED.fetch_add(1, Ordering::Relaxed);
         return Ok(pso);
     }
+    // Told so that a description the host will never match can be seen for
+    // what it is instead of as an entry that is quietly missing.
+    if let Err(e) = &loaded {
+        LOAD_REFUSED.fetch_add(1, Ordering::Relaxed);
+        if LOAD_REFUSED.load(Ordering::Relaxed) % 250 == 1 {
+            tracing::info!(name, error = %e, "host pipeline library load refused");
+        }
+    }
     // A compile that just failed does not retry every frame: the driver
     // compiler under memory pressure needs a breather, and a refusal each
     // frame makes more, not less.
@@ -285,6 +295,7 @@ pub(crate) fn pipeline(
     }
     let pso = made?;
     MADE.fetch_add(1, Ordering::Relaxed);
+    tracing::info!(name, "host pipeline made");
     let _same_name = stripe.lock().unwrap_or_else(|e| e.into_inner());
     let _not_serialising = SERIALISING.read().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live pipeline; a name already stored (a description that
