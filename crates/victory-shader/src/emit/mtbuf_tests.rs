@@ -311,13 +311,11 @@ const STRUCTURED_READ: &[u32] = &[
 #[test]
 fn indexed_load_uses_the_view_stride_when_metadata_is_missing_or_invalid() {
     for metadata in [None, Some(0), Some(6), Some(2052)] {
-        assert!(matches!(
-            buffer_shader(STRUCTURED_READ, metadata, &|_, _| None),
-            Err(crate::ShaderError::Unsupported {
-                what: super::UNKNOWN_STRUCTURED_STRIDE,
-                ..
-            })
-        ));
+        // No usable metadata and no statically identifiable view: the handle
+        // is annotated as data (element width zero) and the descriptor the
+        // title binds states the width. Refusing here would drop every pass
+        // that streams a resource through an index the program computes.
+        buffer_shader(STRUCTURED_READ, metadata, &|_, _| None).expect("a data-annotated handle");
         for stride in [16, 32] {
             let called = std::cell::Cell::new(false);
             buffer_shader(STRUCTURED_READ, metadata, &|binding, required| {
@@ -417,7 +415,9 @@ fn indexed_store_and_atomic_use_the_structured_uav_view_stride() {
             0x8003_0000, // store / atomic_add v0, v0, s[12:15], 0 idxen offset:4
             0xBF81_0000, // s_endpgm
         ];
-        assert!(buffer_shader(&words, None, &|_, _| None).is_err());
+        // No metadata and no statically identifiable view: annotated as
+        // data, with the width left to the descriptor bound at dispatch.
+        buffer_shader(&words, None, &|_, _| None).expect("a data-annotated handle");
         let shader = buffer_shader(&words, None, &|binding, required| {
             if !required {
                 return None;

@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::bitcode::{Attr, Bin, Cast, Module, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
-use super::{StructuredBinding, UNKNOWN_STRUCTURED_STRIDE, UserData, ViewStride};
+use super::{StructuredBinding, UserData, ViewStride};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -4695,8 +4695,16 @@ impl<'a> Lower<'a> {
         if let Some(stride) = self.used_kind(src).map(|u| u.stride).filter(valid) {
             return Ok(stride);
         }
-        self.bound_structured_stride(src, uav, true)
-            .ok_or(UNKNOWN_STRUCTURED_STRIDE)
+        if let Some(stride) = self.bound_structured_stride(src, uav, true) {
+            return Ok(stride);
+        }
+        // Neither the program's metadata nor a statically bound view states
+        // an element width: the descriptor the title binds does, so the
+        // handle is annotated as data and the view is left as it stands.
+        // Refusing here loses every shader that reads a streamed resource
+        // through an index the program computes (the title's whole world
+        // load is compute passes of that shape).
+        Ok(0)
     }
 
     fn bound_structured_stride(&self, src: &Source, uav: bool, required: bool) -> Option<u32> {

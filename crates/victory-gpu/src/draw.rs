@@ -1712,9 +1712,12 @@ impl State {
                 {
                     // Check the same view that is copied to the list's heap.
                     // Failure to mirror it must not bind a null of another kind.
+                    // A binding of zero asks for no particular width: the
+                    // view is bound as it stands.
                     complete = view.is_some_and(|view| {
-                        crate::descriptor::host::structured_stride(&view, binding.uav)
-                            == Some(*stride)
+                        (*stride == 0
+                            || crate::descriptor::host::structured_stride(&view, binding.uav)
+                                == Some(*stride))
                             && host.make_at(index, &view)
                     });
                     if !complete {

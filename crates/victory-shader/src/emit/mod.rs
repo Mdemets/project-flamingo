@@ -290,8 +290,6 @@ pub struct StructuredBinding {
 // binding already being specialized when lowering another access to it.
 type ViewStride<'a> = &'a dyn Fn(StructuredBinding, bool) -> Option<u32>;
 
-const UNKNOWN_STRUCTURED_STRIDE: &str = "a structured buffer of unknown stride";
-
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container, lowering eligible <=32-thread Wave64 reductions to
 /// `WaveSize(32)`.
