@@ -684,6 +684,34 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     } else if code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION {
         // SAFETY: the CPU refused the instruction at `at`, so it fetched it.
         format!(" (code {})", unsafe { instruction_bytes(at) })
+    } else if code == EXCEPTION_BREAKPOINT {
+        // The title's fatal handler raises these with a reason the
+        // registers point at: printable bytes at the pointer registers
+        // and the top of the stack, which a message usually is near.
+        // SAFETY: a live context; the probed pages are read only, and an
+        // unreadable one is skipped by `bytes_at`.
+        let probe = |at: u64, n: usize| -> String {
+            unsafe { bytes_at(at as usize, n) }
+                .map(|b| {
+                    b.iter()
+                        .map(|&c| {
+                            if (0x20..0x7f).contains(&c) {
+                                c as char
+                            } else {
+                                '.'
+                            }
+                        })
+                        .collect::<String>()
+                })
+                .unwrap_or_else(|| "unreadable".into())
+        };
+        format!(
+            " (rcx {:?} rdi {:?} r10 {:?} rsp {:?})",
+            probe(context.Rcx, 96),
+            probe(context.Rdi, 96),
+            probe(context.R10, 96),
+            probe(context.Rsp, 160),
+        )
     } else {
         String::new()
     };
@@ -841,6 +869,36 @@ fn module_of(address: usize) -> Option<String> {
 /// broke (with the module, for an image's pages). Each points at a different
 /// cause: a wild pointer, an allocation whose commit failed, a stack
 /// overrun, a write to code or constants.
+/// The bytes at `at`, up to `n` of them or to the end of `at`'s page,
+/// whichever comes first; `None` when nothing readable is there.
+/// # Safety
+/// A read only.
+unsafe fn bytes_at(at: usize, n: usize) -> Option<&'static [u8]> {
+    use windows_sys::Win32::System::Memory::{
+        PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    };
+    // SAFETY: reads the address space's bookkeeping, not `at` itself.
+    let mut info: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION =
+        unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let ok = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } != 0
+        && info.State & 0x1000 != 0 // MEM_COMMIT
+        && info.Protect & PAGE_GUARD == 0
+        && matches!(
+            info.Protect & 0xff,
+            PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | 0x20 | 0x40 | 0x80
+        );
+    if !ok {
+        return None;
+    }
+    let n = n.min(0x1000 - (at & 0xfff));
+    if n == 0 {
+        return None;
+    }
+    // SAFETY: a committed, readable page; the slice stays inside it.
+    Some(unsafe { std::slice::from_raw_parts(at as *const u8, n) })
+}
+
 fn memory_at(address: usize) -> String {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION,
