@@ -326,7 +326,23 @@ impl HostHeap {
                     count = count_fitting,
                     "host view heap capped at {PORTABLE_VIEWS}"
                 );
-                (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - DYNAMIC)
+                // The driver refuses the largest legal heap too (one run
+                // answered 1_000_000 with The parameter is incorrect), so
+                // the heap shrinks until it is taken.
+                let mut fitting = PORTABLE_VIEWS;
+                let heap = loop {
+                    match make(fitting) {
+                        Ok(heap) => break heap,
+                        Err(e) => {
+                            if fitting <= DYNAMIC + (1 << 16) {
+                                tracing::warn!(error = %e, "no host descriptor heap");
+                                return None;
+                            }
+                            fitting = (fitting - (1 << 16)).max(DYNAMIC + (1 << 16));
+                        }
+                    }
+                };
+                (heap, fitting - DYNAMIC)
             }
             Err(e) => {
                 tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
