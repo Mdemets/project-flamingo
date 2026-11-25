@@ -873,6 +873,12 @@ struct View {
     len: usize,
 }
 
+// SAFETY: a view's handle is process-wide; the runtime only maps and
+// unmaps it, and either is fine on any thread.
+unsafe impl Send for View {}
+// SAFETY: as above; the cache holds views across threads.
+unsafe impl Sync for View {}
+
 impl View {
     /// Maps `n` slices from `slice` on.
     fn map(slice: &Slice, n: usize) -> Option<View> {
@@ -1037,13 +1043,26 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     };
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
-        let Some(mut view) = View::map(slice, *n) else {
-            return false;
+        let key = (Arc::as_ptr(&slice.section) as usize, slice.index, *n);
+        let mut view = match scratch_cache_take(key) {
+            Some(view) => {
+                let mut view = view;
+                let k = (n * PAGE - within).min(data.len() - done);
+                view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+                (within, done) = (0, done + k);
+                scratch_cache_put(key, view);
+                continue;
+            }
+            None => match View::map(slice, *n) {
+                Some(view) => view,
+                None => return false,
+            },
         };
         let k = (n * PAGE - within).min(data.len() - done);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
         victory_gpu::mapped_pages_written(physical().written_views(slice, within, k));
         (within, done) = (0, done + k);
+        scratch_cache_put(key, view);
     }
     true
 }
@@ -1052,8 +1071,11 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
 /// until dropped: DirectStorage decodes into it instead of a buffer it
 /// would then copy.
 pub(crate) struct PageWindow {
-    view: View,
     slice: Slice,
+    view: Option<View>,
+    /// The cache key the view came from, when it is a cached one: the
+    /// drop returns it instead of unmapping it.
+    cache: Option<(usize, usize, usize)>,
     within: usize,
     len: usize,
 }
@@ -1063,7 +1085,9 @@ impl PageWindow {
         mut self,
         write: impl FnOnce(&mut [u8]) -> Result<usize, E>,
     ) -> Result<(), E> {
-        let out = &mut self.view.bytes()[self.within..self.within + self.len];
+        let out =
+            &mut self.view.as_mut().expect("a window has a view").bytes()
+                [self.within..self.within + self.len];
         let result = write(out);
         // A failed read or decode can leave a partial prefix of unknown size.
         let bytes = result.as_ref().copied().unwrap_or(self.len).min(self.len);
@@ -1074,6 +1098,49 @@ impl PageWindow {
         ));
         result.map(drop)
     }
+
+    pub(crate) fn bytes(&mut self) -> &mut [u8] {
+        let (within, len) = (self.within, self.len);
+        &mut self.view.as_mut().expect("a window has a view").bytes()[within..within + len]
+    }
+}
+
+impl Drop for PageWindow {
+    fn drop(&mut self) {
+        if let (Some(view), Some(key)) = (self.view.take(), self.cache.take()) {
+            scratch_cache_put(key, view);
+        }
+    }
+}
+
+/// Mapped scratch views of runs of pages, by (section, first page, run
+/// length). The world load maps and unmaps thousands of views a second,
+/// and the driver answers the system's exhaustion with Not enough memory
+/// (0x8007000E) for pipeline compilations it runs in that state; a
+/// request's window reused from the cache pays no map or unmap, and most
+/// requests read the same runs again. Capped: the oldest entry leaves
+/// when the 384th arrives.
+static SCRATCH_CACHE: LazyLock<
+    Mutex<std::collections::HashMap<(usize, usize, usize), (View, std::time::Instant)>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn scratch_cache_put(key: (usize, usize, usize), view: View) {
+    let mut cache = SCRATCH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= 384
+        && let Some(oldest) = cache.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| *k)
+    {
+        cache.remove(&oldest); // the view unmaps
+    }
+    cache.insert(key, (view, std::time::Instant::now()));
+}
+
+/// Takes a cached view of `key`, if one is there.
+fn scratch_cache_take(key: (usize, usize, usize)) -> Option<View> {
+    SCRATCH_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key)
+        .map(|(view, _)| view)
 }
 
 /// A window on bytes `[offset, offset + len)` of `pages` when they are
@@ -1086,9 +1153,15 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    let key = (Arc::as_ptr(&slice.section) as usize, slice.index, *n);
+    let (view, cache) = match scratch_cache_take(key) {
+        Some(view) => (Some(view), Some(key)),
+        None => (Some(View::map(slice, *n)?), None),
+    };
     Some(PageWindow {
-        view: View::map(slice, *n)?,
         slice: slice.clone(),
+        view,
+        cache,
         within: offset % PAGE,
         len,
     })
