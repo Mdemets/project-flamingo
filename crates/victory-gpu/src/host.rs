@@ -3084,6 +3084,11 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
+/// Whether a swap chain can show a texture of this format.
+pub(crate) fn presents(format: u32) -> bool {
+    swap_format(DXGI_FORMAT(format as i32)).is_some()
+}
+
 const BUFFERS: u32 = 2;
 
 /// Luminance bounds of the host display when HDR (HDR10 / PQ) is active on

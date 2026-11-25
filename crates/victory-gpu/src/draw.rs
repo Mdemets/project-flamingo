@@ -1879,6 +1879,10 @@ impl State {
         let prepared = self.prepare(list, false);
         let rects = prepared && self.needs_rect_expansion();
         let ran = prepared && (!rects || self.rectangles(list, vertices, first));
+        #[cfg(all(windows, feature = "diagnostics"))]
+        if ran {
+            crate::capture::drew(&self.targets);
+        }
         if ran {
             // Rectangles were expanded into their own vertex buffers (their
             // count checked to fit by `rectangles`).

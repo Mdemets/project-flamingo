@@ -357,6 +357,29 @@ extern "system" fn present(
         .map(|plane| unsafe { *plane.resources })
         .filter(|resource| !resource.is_null())
         .map(object::Held::new);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if crate::capture::listed(FRAMES.load(Ordering::Relaxed) + 1) {
+        let list: Vec<(u32, Vec<usize>)> = (0..planes.min(4))
+            .filter_map(|i| {
+                // SAFETY: the title passes `planes` plane descriptions.
+                unsafe { plane_parameters.add(i as usize).as_ref() }
+            })
+            .map(|p| {
+                let resources: Vec<usize> = (0..p.count.min(4))
+                    .map(|r| {
+                        if p.resources.is_null() {
+                            0
+                        } else {
+                            // SAFETY: the plane lists `count` resources.
+                            unsafe { *p.resources.add(r as usize) as usize }
+                        }
+                    })
+                    .collect();
+                (p.count, resources)
+            })
+            .collect();
+        tracing::info!(planes, ?list, "present planes");
+    }
     queue(this)
         .timeline
         .submit(Op::Run(Box::new(move || show(resource))));
@@ -367,6 +390,12 @@ extern "system" fn present(
 /// and shows the plane's first resource.
 fn show(resource: Option<object::Held>) {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // Diagnostics: a title that presents a plane only the console's
+    // compositor fills (we get a black one) is shown from the frame's
+    // busiest target instead; `VICTORY_SHOW_TARGET=auto` shows that target
+    // even when the title does draw into the one it presents.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let resource = crate::capture::busiest(resource.as_ref().map(object::Held::get)).or(resource);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -397,6 +426,11 @@ fn show(resource: Option<object::Held>) {
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     if crate::capture::listed(frame) {
+        tracing::info!(
+            frame,
+            resource = ?resource.as_ref().map(object::Held::get),
+            "presenting this resource"
+        );
         crate::capture::dump_targets(frame);
     }
     #[cfg(windows)]

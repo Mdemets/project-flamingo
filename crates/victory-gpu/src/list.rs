@@ -663,7 +663,12 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::texture::host_written(dst);
             list.mark_work();
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
+            {
+                if crate::capture::listed(crate::queue::presented() + 1) {
+                    tracing::info!("copy resource {src:?} to {dst:?}");
+                }
+                list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
+            }
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
             mark_work(this);
@@ -897,6 +902,9 @@ extern "system" fn copy_texture_region(
                     (src.kind == FOOTPRINT).then_some(src.footprint)
                 )
             };
+            if crate::capture::listed(crate::queue::presented() + 1) {
+                tracing::info!("{}", text());
+            }
             match read {
                 Some(range) => list.note_read(text, range),
                 None => list.note_op(text),
@@ -965,7 +973,12 @@ extern "system" fn resolve(
         crate::texture::host_written(dst);
         list.mark_work();
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
+        {
+            if crate::capture::listed(crate::queue::presented() + 1) {
+                tracing::info!("resolve {src:?} to {dst:?} format {format}");
+            }
+            list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
+        }
         let extent = |d: D3D12_RESOURCE_DESC, subresource: u32| {
             // Mips are the low-order component of an array or plane subresource index.
             let mip = subresource % u32::from(d.MipLevels);

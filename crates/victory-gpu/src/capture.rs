@@ -241,6 +241,98 @@ mod show_tests {
     }
 }
 
+/// Whether to show the frame's busiest render target instead of the
+/// presented one (`VICTORY_SHOW_TARGET=auto`): titles that present a plane
+/// the console's compositor fills leave ours black, and the frame's real
+/// content is drawn into a target of their own.
+static AUTO: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("VICTORY_SHOW_TARGET").is_ok_and(|v| v.trim().eq_ignore_ascii_case("auto"))
+});
+
+/// Targets drawn into since the last present, with their draw counts.
+static DREW: std::sync::Mutex<Vec<(crate::object::Held, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Counts one draw into each of the bound targets (held, so they live
+/// until the frame is shown).
+pub(crate) fn drew(targets: &[usize]) {
+    let mut drew = DREW.lock().unwrap_or_else(|e| e.into_inner());
+    for &target in targets.iter().filter(|&&t| t != 0) {
+        match drew
+            .iter_mut()
+            .find(|(held, _)| held.get() as usize == target)
+        {
+            Some((_, draws)) => *draws += 1,
+            None => drew.push((crate::object::Held::new(target as crate::object::This), 1)),
+        }
+    }
+}
+
+/// Whether the swap chain can show a texture of this format and shape.
+fn presentable(texture: &ID3D12Resource) -> bool {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && d.SampleDesc.Count == 1
+        && d.Width >= 320
+        && crate::host::presents(d.Format.0 as u32)
+}
+
+/// The busiest target of the frame just drawn, taken (the next frame starts
+/// over): the one to show when `presented` is not somewhere the title draws.
+/// `None` when the title drew into `presented` (unless [AUTO]) or no target
+/// can be presented.
+pub(crate) fn busiest(presented: Option<crate::object::This>) -> Option<crate::object::Held> {
+    let mut drew = DREW.lock().unwrap_or_else(|e| e.into_inner());
+    let top = drew.iter().map(|(_, draws)| *draws).max().unwrap_or(0);
+    let at = presented.and_then(|p| {
+        drew.iter()
+            .find(|(held, _)| held.get() == p)
+            .map(|(_, d)| *d)
+    });
+    // A title that draws its frame into the plane it presents shows it
+    // there; one whose plane stays empty has its content elsewhere.
+    if at.is_some_and(|draws| draws * 2 >= top) && !*AUTO {
+        drew.clear();
+        return None;
+    }
+    let area = |held: &crate::object::Held| -> u64 {
+        crate::resource::host_resource(held.get()).map_or(0, |t| {
+            // SAFETY: a live resource.
+            let d = unsafe { t.GetDesc() };
+            d.Width * u64::from(d.Height)
+        })
+    };
+    // Only targets at least half the frame's biggest: a title's small
+    // temporaries see more draws than the composite that ends the frame.
+    let biggest = drew
+        .iter()
+        .filter(|(held, _)| crate::resource::host_resource(held.get()).is_some_and(presentable))
+        .map(|(held, _)| area(held))
+        .max()
+        .unwrap_or(0);
+    let best = drew
+        .iter()
+        .enumerate()
+        .filter(|(_, (held, _))| {
+            area(held) * 2 >= biggest
+                && crate::resource::host_resource(held.get()).is_some_and(presentable)
+        })
+        .max_by_key(|(_, (held, draws))| (*draws, area(held)))
+        .map(|(i, _)| i);
+    let best = best.map(|i| drew.swap_remove(i).0);
+    drew.clear();
+    if top > 0 && tracing::enabled!(tracing::Level::DEBUG) {
+        tracing::debug!(
+            presented = format_args!("{presented:?}"),
+            at,
+            top,
+            chosen = format_args!("{:?}", best.as_ref().map(|h| h.get())),
+            "choosing what to show"
+        );
+    }
+    best
+}
+
 /// The last render target bound that matches [`show_spec`].
 static SHOWN: std::sync::Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>> =
     std::sync::Mutex::new(None);
