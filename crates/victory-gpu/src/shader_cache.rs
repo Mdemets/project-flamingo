@@ -97,6 +97,23 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
         Some(cache) => cached(cache, build(wave32), container, translate),
         None => translate(container),
     }
+    .inspect(|shader| dump_shader(container, shader))
+}
+
+/// With `VICTORY_SHADER_DUMP=<dir>` set, the console shader, its DXIL
+/// translation and the translation's description go to `dir`, named by
+/// the container's hash — the name the logs and warnings use. Every
+/// translation, cache hit or miss, is dumped, so one run captures all.
+fn dump_shader(container: &[u8], shader: &HostShader) {
+    let Some(dir) = std::env::var_os("VICTORY_SHADER_DUMP") else {
+        return;
+    };
+    let name = blake3::hash(container).to_hex()[..16].to_string();
+    let dir = std::path::PathBuf::from(dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join(format!("{name}-console.bin")), container);
+    let _ = std::fs::write(dir.join(format!("{name}-host.dxil")), &shader.dxil);
+    let _ = std::fs::write(dir.join(format!("{name}-host.txt")), format!("{:?}\n", shader));
 }
 
 /// The cache entry's converter: the build and the container in, the encoded

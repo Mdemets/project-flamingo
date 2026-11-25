@@ -910,6 +910,18 @@ impl HostHeap {
                 self.track_slot(index, None);
                 self.track_buffer(index, None);
             }
+            static NULLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = NULLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 {
+                tracing::debug!(
+                    index,
+                    tag = format_args!("{tag:#x}"),
+                    i,
+                    generation,
+                    for_draw,
+                    "a slot mirrored to null"
+                );
+            }
             return None;
         };
         // A streamed texture's host SRV may have been narrowed to the levels

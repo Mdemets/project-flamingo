@@ -566,6 +566,25 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    if record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION
+        && record.NumberParameters >= 2
+    {
+        // A first-chance access violation names its site and its target;
+        // handlers of ours or the title's may still take it, so this is a
+        // trace, not a report.
+        static SITES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 32 || n.is_power_of_two() {
+            tracing::debug!(
+                site = locate(record.ExceptionAddress as usize),
+                at = format_args!("{:#x}", record.ExceptionInformation[1]),
+                kind = record.ExceptionInformation[0],
+                "first-chance access violation"
+            );
+        }
+    }
+    // SAFETY: as above.
     let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
     if FATAL.contains(&code) {
         let to_file =
@@ -867,11 +886,27 @@ fn memory_at(address: usize) -> String {
     {
         detail.push_str(&format!(", in {module}"));
     }
+    if info.Type == MEM_MAPPED
+        && let Some(file) = mapped_file(address)
+    {
+        detail.push_str(&format!(", from {file}"));
+    }
     let offset = address - info.AllocationBase as usize;
     format!(
         "{detail}, {kind} allocation +{offset:#x}, region size {:#x}",
         info.RegionSize
     )
+}
+
+/// The file a mapped allocation shows, when it has one.
+fn mapped_file(address: usize) -> Option<String> {
+    use windows_sys::Win32::System::ProcessStatus::GetMappedFileNameW;
+    let mut path = [0u16; 1024];
+    // SAFETY: a query of our own address space into `path`.
+    let len = unsafe {
+        GetMappedFileNameW(std::ptr::null_mut(), address as *const _, path.as_mut_ptr(), 1024)
+    };
+    (len > 0).then(|| String::from_utf16_lossy(&path[..len as usize - 1]))
 }
 
 #[cfg(test)]
