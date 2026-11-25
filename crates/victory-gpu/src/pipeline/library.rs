@@ -232,8 +232,41 @@ pub(crate) fn pipeline(
         LOADED.fetch_add(1, Ordering::Relaxed);
         return Ok(pso);
     }
-    // Compiled outside the locks: compiles take up to seconds.
-    let pso = create()?;
+    // A compile that just failed does not retry every frame: the driver
+    // compiler under memory pressure needs a breather, and a refusal each
+    // frame makes more, not less.
+    static COOL: OnceLock<Mutex<std::collections::HashMap<u64, std::time::Instant>>> =
+        OnceLock::new();
+    let cool = COOL.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let key = {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write(name.as_bytes());
+        h.finish()
+    };
+    if let Some(&when) = cool.lock().unwrap_or_else(|e| e.into_inner()).get(&key)
+        && when.elapsed() < std::time::Duration::from_secs(10)
+    {
+        return Err(windows::Win32::Foundation::E_OUTOFMEMORY.into());
+    }
+    // One compile at a time: concurrent ones each hold the driver
+    // compiler's intermediates for a huge module at once, and the
+    // driver answers Not enough memory (0x8007000E) sooner for it.
+    static COMPILING: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = COMPILING
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // Compiled outside the library lock: compiles take up to seconds.
+    let made = create();
+    if made.is_err() {
+        cool.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, std::time::Instant::now());
+    } else {
+        cool.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+    }
+    let pso = made?;
     MADE.fetch_add(1, Ordering::Relaxed);
     let _same_name = stripe.lock().unwrap_or_else(|e| e.into_inner());
     let _not_serialising = SERIALISING.read().unwrap_or_else(|e| e.into_inner());
