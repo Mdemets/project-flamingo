@@ -157,6 +157,20 @@ impl Shadow {
         Some(unsafe { std::slice::from_raw_parts(self.data.add(at), len) })
     }
 
+    /// The `n` little-endian dwords at a title address inside the buffer,
+    /// from the host copy as it stands now.
+    pub(crate) fn u32s(&self, address: u64, n: usize) -> Option<Vec<u32>> {
+        let at = self.offset(address) as usize;
+        let to = at.checked_add(n * 4)?;
+        (to <= self.len as usize).then(|| {
+            // SAFETY: inside the mapping, read only.
+            (unsafe { std::slice::from_raw_parts(self.data.add(at), n * 4) })
+                .chunks_exact(4)
+                .map(|w| u32::from_le_bytes(w.try_into().expect("four bytes")))
+                .collect()
+        })
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset. Cut to the copy.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {

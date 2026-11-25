@@ -2224,8 +2224,13 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
+            let grid = (kind == DISPATCH)
+                .then(|| args.u32s(arguments, 3))
+                .flatten()
+                .map(|g| format!(" grid {g:?}"))
+                .unwrap_or_default();
             self.op_text(
-                format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                format!("indirect kind {kind} max {max} at {arguments:#x}{grid}"),
                 kind == DISPATCH,
             )
         });

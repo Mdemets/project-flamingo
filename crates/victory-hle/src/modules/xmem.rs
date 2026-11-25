@@ -678,6 +678,18 @@ fn install_rescue() {
                 }
             }
         }
+        static REFUSED: AtomicUsize = AtomicUsize::new(0);
+        let n = REFUSED.fetch_add(1, Ordering::Relaxed);
+        if n < 8 || n.is_power_of_two() {
+            tracing::debug!(
+                at = format_args!("{at:#x}"),
+                kind,
+                state = format_args!("{:#x}", page.State),
+                protect = format_args!("{:#x}", page.Protect),
+                scratch = scratch_at(at).unwrap_or("no"),
+                "the page refused the access; the fault stands"
+            );
+        }
         if !physical().raced(at) {
             static MISSED: AtomicUsize = AtomicUsize::new(0);
             let n = MISSED.fetch_add(1, Ordering::Relaxed);
