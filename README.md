@@ -9,6 +9,8 @@ The title's x86-64 code runs unchanged inside our process; VIctory supplies
 the platform underneath it and converts the title's data, ahead of time where
 it can and on first use where it must (shaders). See
 [docs/architecture.md](docs/architecture.md).
+How a console differs from a PC, and where each difference lands in the tree, is
+written down in [docs/console-vs-pc.md](docs/console-vs-pc.md).
 
 The Windows executable can also be launched under Proton on x86-64 Linux. See
 [Running with the Proton launcher](docs/proton-launcher.md).
