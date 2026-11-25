@@ -110,7 +110,10 @@ fn dump_shader(container: &[u8], shader: &HostShader) {
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join(format!("{name}-console.bin")), container);
     let _ = std::fs::write(dir.join(format!("{name}-host.dxil")), &shader.dxil);
-    let _ = std::fs::write(dir.join(format!("{name}-host.txt")), format!("{:?}\n", shader));
+    let _ = std::fs::write(
+        dir.join(format!("{name}-host.txt")),
+        format!("{:?}\n", shader),
+    );
 }
 
 /// The cache entry's converter: the build and the container in, the encoded

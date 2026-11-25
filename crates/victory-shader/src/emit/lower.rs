@@ -11459,6 +11459,7 @@ mod tests {
                 input_addr: 0,
                 rsrc2: Default::default(),
                 db_shader_control: 0,
+                rsrc2: crate::native::PsRsrc2::default(),
                 patches: vec![],
             },
             code,
