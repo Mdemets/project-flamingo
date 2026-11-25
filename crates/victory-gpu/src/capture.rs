@@ -295,6 +295,25 @@ pub(crate) fn busiest(presented: Option<crate::object::This>) -> Option<crate::o
         drew.clear();
         return None;
     }
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let mut text = String::new();
+        for (held, draws) in drew.iter() {
+            let d = crate::resource::host_resource(held.get()).map(|t| {
+                // SAFETY: a live resource.
+                unsafe { t.GetDesc() }
+            });
+            if let Some(d) = d {
+                text.push_str(&format!(
+                    " {:#x}:{}x{}f{}={draws}",
+                    held.get() as usize,
+                    d.Width,
+                    d.Height,
+                    d.Format.0
+                ));
+            }
+        }
+        tracing::debug!("frame targets{text}");
+    }
     let area = |held: &crate::object::Held| -> u64 {
         crate::resource::host_resource(held.get()).map_or(0, |t| {
             // SAFETY: a live resource.

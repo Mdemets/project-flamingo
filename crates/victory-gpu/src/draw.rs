@@ -1403,6 +1403,8 @@ impl State {
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(all(windows, feature = "diagnostics"))]
+                    crate::capture::drew(&self.targets);
                     true
                 }
                 Err(_) => false,
@@ -1899,6 +1901,8 @@ impl State {
                     .DrawInstanced(count, instances, from, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            #[cfg(all(windows, feature = "diagnostics"))]
+            crate::capture::drew(&self.targets);
         }
         #[cfg(feature = "diagnostics")]
         self.frame_op("draw", false, ran);
@@ -2004,6 +2008,8 @@ impl State {
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            #[cfg(all(windows, feature = "diagnostics"))]
+            crate::capture::drew(&self.targets);
         }
         #[cfg(feature = "diagnostics")]
         self.frame_op("draw_indexed", false, ran);
@@ -2113,6 +2119,8 @@ impl State {
             };
             if max == 0 {
                 DRAWN.fetch_add(1, Ordering::Relaxed);
+                #[cfg(all(windows, feature = "diagnostics"))]
+                crate::capture::drew(&self.targets);
                 return true;
             }
             let prepared = match crate::rectangles::expand(
@@ -2158,6 +2166,8 @@ impl State {
             };
             prepared.after_draw(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            #[cfg(all(windows, feature = "diagnostics"))]
+            crate::capture::drew(&self.targets);
             return true;
         }
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
@@ -2257,6 +2267,8 @@ impl State {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            #[cfg(all(windows, feature = "diagnostics"))]
+            crate::capture::drew(&self.targets);
         }
         true
     }
