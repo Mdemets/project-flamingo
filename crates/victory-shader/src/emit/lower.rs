@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::bitcode::{Attr, Bin, Cast, Module, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
-use super::{StructuredBinding, UNKNOWN_STRUCTURED_STRIDE, UserData, ViewStride};
+use super::{StructuredBinding, UserData, ViewStride};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -5580,7 +5580,14 @@ impl<'a> Lower<'a> {
         match self.bound_view_stride(src, uav, true) {
             Some(0) => Ok(IndexedStride::Raw),
             Some(stride) => Ok(IndexedStride::Structured(stride)),
-            None => Err(UNKNOWN_STRUCTURED_STRIDE),
+            // Neither the program's metadata nor a statically bound view
+            // states an element width: the descriptor the title binds does,
+            // so the access is annotated as data (stride zero) and the view
+            // is left as it stands. Refusing here loses every shader that
+            // reads a streamed resource through an index the program
+            // computes (the title's whole world load is compute passes of
+            // that shape).
+            None => Ok(IndexedStride::Raw),
         }
     }
 

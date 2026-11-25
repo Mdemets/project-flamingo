@@ -610,7 +610,7 @@ impl HostHeap {
         let Some((address, len, desc)) = buffer_srv_parts(view) else {
             return false;
         };
-        let Some(alias) = structured_alias(desc, stride) else {
+        let Some(alias) = structured_bind(desc, stride) else {
             return false;
         };
         let Some(kept) = buffer_srv_inner(address, len, alias, self.cpu(index), true) else {
@@ -1774,6 +1774,20 @@ pub(crate) fn selected_buffer(view: &View) -> Option<BufferRead> {
         bytes,
         stride,
     })
+}
+
+/// The descriptor that gives `desc` element width `stride`. Zero asks for
+/// the view as it stands: the program's handle is annotated as data (the
+/// console compiler left no width), so the title's descriptor is the one
+/// that states it.
+fn structured_bind(
+    desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
+    stride: u32,
+) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    if stride == 0 {
+        return (desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER).then_some(desc);
+    }
+    structured_alias(desc, stride)
 }
 
 /// Re-expresses the exact byte start and length of a raw buffer SRV as
@@ -4103,6 +4117,38 @@ mod structured_alias_tests {
         assert!(structured_alias(raw_srv_desc(0, 16), 0).is_none());
         assert!(structured_alias(raw_srv_desc(0, 16), 6).is_none());
         assert!(structured_alias(raw_srv_desc(0, 16), 4096).is_none());
+    }
+
+    #[test]
+    fn a_zero_stride_binds_the_titles_own_descriptor() {
+        // The program annotated the handle as data: the view states the width.
+        let mut structured = raw_srv_desc(0, 2);
+        structured.Format = DXGI_FORMAT_UNKNOWN;
+        structured.Anonymous.Buffer.StructureByteStride = 64;
+        structured.Anonymous.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+        let kept = structured_bind(structured, 0).expect("a buffer view bound as it stands");
+        // SAFETY: `ViewDimension == D3D12_SRV_DIMENSION_BUFFER`.
+        let buf = unsafe { kept.Anonymous.Buffer };
+        assert_eq!(buf.StructureByteStride, 64);
+        assert_eq!(buf.NumElements, 2);
+        // A raw view keeps its bytes: the shader addresses them itself.
+        let raw = structured_bind(raw_srv_desc(4, 16), 0).expect("a raw view as it stands");
+        assert_eq!(raw.Format, DXGI_FORMAT_R32_TYPELESS);
+        // A texture cannot be a structured buffer.
+        let tex = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            ..Default::default()
+        };
+        assert!(structured_bind(tex, 0).is_none());
+        // A known stride still re-expresses a raw view.
+        let alias = structured_bind(raw_srv_desc(16, 32), 64).expect("aligned raw SRV");
+        // SAFETY: `ViewDimension == D3D12_SRV_DIMENSION_BUFFER`.
+        let buf = unsafe { alias.Anonymous.Buffer };
+        assert_eq!(buf.StructureByteStride, 64);
+        assert_eq!(buf.FirstElement, 1);
+        assert_eq!(buf.NumElements, 2);
     }
 
     #[test]
