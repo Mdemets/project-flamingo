@@ -567,9 +567,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
     // SAFETY: as above.
     let record = unsafe { &*(*info).ExceptionRecord };
-    if record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION
-        && record.NumberParameters >= 2
-    {
+    if record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record.NumberParameters >= 2 {
         // A first-chance access violation names its site and its target;
         // handlers of ours or the title's may still take it, so this is a
         // trace, not a report.
@@ -962,7 +960,12 @@ fn mapped_file(address: usize) -> Option<String> {
     let mut path = [0u16; 1024];
     // SAFETY: a query of our own address space into `path`.
     let len = unsafe {
-        GetMappedFileNameW(std::ptr::null_mut(), address as *const _, path.as_mut_ptr(), 1024)
+        GetMappedFileNameW(
+            std::ptr::null_mut(),
+            address as *const _,
+            path.as_mut_ptr(),
+            1024,
+        )
     };
     (len > 0).then(|| String::from_utf16_lossy(&path[..len as usize - 1]))
 }

@@ -629,7 +629,8 @@ fn install_rescue() {
         // dies as it should.
         let admits = |protect: u32, kind: u32| {
             let readable = protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY) != 0;
-            let writable = protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE) != 0;
+            let writable =
+                protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE) != 0;
             kind == 0 && readable || kind == 1 && writable
         };
         // SAFETY: plain data; zero is a valid value.
@@ -637,9 +638,7 @@ fn install_rescue() {
         let size = size_of::<MEMORY_BASIC_INFORMATION>();
         // SAFETY: a query of our own address space into `page`.
         unsafe { VirtualQuery(at as *const c_void, &mut page, size) };
-        if page.Protect & PAGE_GUARD == 0
-            && page.State == MEM_COMMIT
-            && admits(page.Protect, kind)
+        if page.Protect & PAGE_GUARD == 0 && page.State == MEM_COMMIT && admits(page.Protect, kind)
         {
             static RESCUED: AtomicUsize = AtomicUsize::new(0);
             let n = RESCUED.fetch_add(1, Ordering::Relaxed);
@@ -972,16 +971,16 @@ fn mapped_dump() {
         {
             lines.push(format!(
                 "    {:#x}-{:#x} state {:#x} protect {:#x} size {:#x}",
-                info.BaseAddress as usize,
-                end,
-                info.State,
-                info.Protect,
-                info.RegionSize
+                info.BaseAddress as usize, end, info.State, info.Protect, info.RegionSize
             ));
         }
         at = end.max(at + PAGE);
     }
-    tracing::debug!(n = lines.len(), "mapped views of the process:\n{}", lines.join("\n"));
+    tracing::debug!(
+        n = lines.len(),
+        "mapped views of the process:\n{}",
+        lines.join("\n")
+    );
 }
 
 /// What a scratch view says about `at`: none, live, or freed.
@@ -992,12 +991,7 @@ fn scratch_at(at: usize) -> Option<&'static str> {
         .range(..=at)
         .next_back()
         .is_some_and(|(base, len)| at < base + *len);
-    Some(if live {
-        "live"
-    } else {
-        "freed"
-    })
-    .filter(|_| {
+    Some(if live { "live" } else { "freed" }).filter(|_| {
         SCRATCH_EVER
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1085,9 +1079,8 @@ impl PageWindow {
         mut self,
         write: impl FnOnce(&mut [u8]) -> Result<usize, E>,
     ) -> Result<(), E> {
-        let out =
-            &mut self.view.as_mut().expect("a window has a view").bytes()
-                [self.within..self.within + self.len];
+        let out = &mut self.view.as_mut().expect("a window has a view").bytes()
+            [self.within..self.within + self.len];
         let result = write(out);
         // A failed read or decode can leave a partial prefix of unknown size.
         let bytes = result.as_ref().copied().unwrap_or(self.len).min(self.len);
