@@ -333,6 +333,18 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
+/// Diagnostics: the title resource the last present named (before the
+/// diagnostics fallback may show another), which a copy into the presented
+/// plane is told from.
+#[cfg(all(windows, feature = "diagnostics"))]
+static PRESENTED_RESOURCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Diagnostics: the title resource the last present named.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn presented_resource() -> usize {
+    PRESENTED_RESOURCE.load(Ordering::Relaxed)
+}
+
 /// Shows the first plane's first resource in our window.
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
@@ -380,16 +392,27 @@ extern "system" fn present(
             .collect();
         tracing::info!(planes, ?list, "present planes");
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    PRESENTED_RESOURCE.store(
+        resource.as_ref().map_or(0, |held| held.get() as usize),
+        Ordering::Relaxed,
+    );
+    // The copies this present ends, for the frame's line in `show`.
+    let copies = crate::list::take_copies();
     queue(this)
         .timeline
-        .submit(Op::Run(Box::new(move || show(resource))));
+        .submit(Op::Run(Box::new(move || show(resource, copies))));
     S_OK
 }
 
 /// A present, once the queue's work before it has run: counts the frame
 /// and shows the plane's first resource.
-fn show(resource: Option<object::Held>) {
+fn show(resource: Option<object::Held>, copies: crate::list::Copies) {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // The resource the title presented, before the fallback below may show
+    // another one: what this frame's copies are checked against.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let presented = resource.as_ref().map_or(0, |held| held.get() as usize);
     // Diagnostics: a title that presents a plane only the console's
     // compositor fills (we get a black one) is shown from the frame's
     // busiest target instead; `VICTORY_SHOW_TARGET=auto` shows that target
@@ -433,6 +456,35 @@ fn show(resource: Option<object::Held>) {
         );
         crate::capture::dump_targets(frame);
     }
+    // What the copies the title issued this frame were, and whether any of
+    // them wrote the resource it presents: the frame's copy answer.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if crate::capture::copies_logged(frame) {
+        let shown = resource.as_ref().map_or(0, |held| held.get() as usize);
+        tracing::info!(
+            frame,
+            presented = format_args!("{presented:#x}"),
+            shown = format_args!("{shown:#x}"),
+            copy_resource = copies.recorded[0],
+            copy_texture_region = copies.recorded[1],
+            resolve = copies.recorded[2],
+            readbacks = copies.readbacks,
+            buffer_copies = copies.buffers,
+            attempts = format_args!(
+                "{}/{}/{}",
+                copies.attempts[0], copies.attempts[1], copies.attempts[2]
+            ),
+            skipped = format_args!(
+                "{}/{}/{}",
+                copies.skipped[0], copies.skipped[1], copies.skipped[2]
+            ),
+            copies_into_presented = copies.into_presented(presented),
+            copy_pairs = copies.text(presented),
+            "copies this frame"
+        );
+    }
+    #[cfg(not(all(windows, feature = "diagnostics")))]
+    let _ = copies;
     #[cfg(windows)]
     if let Some(resource) = resource.as_ref().map(object::Held::get)
         && let Some(texture) = crate::resource::host_resource(resource)

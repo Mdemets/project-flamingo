@@ -29,6 +29,13 @@ pub(crate) fn listed(n: u64) -> bool {
     .contains(&n)
 }
 
+/// Whether frame `n`'s copies and resolves are logged: the frames listed in
+/// `VICTORY_CAPTURE_FRAMES`, as the present is, and every frame while targets
+/// are dumped (`VICTORY_DUMP_TARGETS`, which no frame number limits).
+pub(crate) fn copies_logged(n: u64) -> bool {
+    dump_on() || listed(n)
+}
+
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
     folder().is_some() && (n.is_power_of_two() || listed(n))

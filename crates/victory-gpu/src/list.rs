@@ -629,6 +629,175 @@ fn mip_dropped(texture: This) -> bool {
     dropped
 }
 
+/// Diagnostics: the copies and resolves recorded since the last present, so
+/// the log settles whether the copy that fills the presented resource is
+/// issued and whether we record it. Title texture copies are named one by one
+/// (they are rare, and each can fill the presented plane); buffer copies are
+/// only counted (a frame has many thousands).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) mod copies {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+
+    /// The kinds of copy the log names, as indices into the counters.
+    pub(crate) const RESOURCE: usize = 0;
+    pub(crate) const REGION: usize = 1;
+    pub(crate) const RESOLVE: usize = 2;
+
+    const KINDS: [&str; 3] = ["CopyResource", "CopyTextureRegion", "ResolveSubresource"];
+
+    static ATTEMPTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static RECORDED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static SKIPPED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static READBACKS: AtomicU64 = AtomicU64::new(0);
+    static BUFFERS: AtomicU64 = AtomicU64::new(0);
+    /// The (destination, source) title resources of the frame's texture copies.
+    static PAIRS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+    /// The frame's texture copies past [`CAP`], counted only.
+    static MORE: AtomicU64 = AtomicU64::new(0);
+    /// The first skip of each kind has been logged.
+    static SAID: [AtomicBool; 3] = [const { AtomicBool::new(false) }; 3];
+
+    /// Named texture copies per frame; the rest are counted in [`MORE`].
+    const CAP: usize = 32;
+
+    /// What the copies since a present were.
+    #[derive(Default)]
+    pub(crate) struct Copies {
+        pub(crate) attempts: [u64; 3],
+        pub(crate) recorded: [u64; 3],
+        pub(crate) skipped: [u64; 3],
+        pub(crate) readbacks: u64,
+        pub(crate) buffers: u64,
+        pub(crate) pairs: Vec<(usize, usize)>,
+        pub(crate) more: u64,
+    }
+
+    impl Copies {
+        /// The copies whose destination is the presented resource.
+        pub(crate) fn into_presented(&self, presented: usize) -> usize {
+            if presented == 0 {
+                return 0;
+            }
+            self.pairs
+                .iter()
+                .filter(|(dst, _)| *dst == presented)
+                .count()
+        }
+
+        /// `source->destination` pairs as text, `*` marking a copy into the
+        /// presented resource.
+        pub(crate) fn text(&self, presented: usize) -> String {
+            let mut text = String::new();
+            for &(dst, src) in &self.pairs {
+                let into = presented != 0 && dst == presented;
+                text.push_str(&format!(
+                    "{}0x{src:x}->0x{dst:x} ",
+                    if into { "*" } else { "" }
+                ));
+            }
+            if self.more > 0 {
+                text.push_str(&format!("+{} not named", self.more));
+            }
+            text
+        }
+    }
+
+    /// A copy of kind `kind` was attempted (recorded or not).
+    pub(crate) fn attempt(kind: usize) {
+        ATTEMPTS[kind].fetch_add(1, Relaxed);
+    }
+
+    /// A copy of kind `kind` from `src` into `dst` was recorded on the host
+    /// lists: logged, with the resource the title last presented.
+    pub(crate) fn recorded(kind: usize, dst: crate::object::This, src: crate::object::This) {
+        RECORDED[kind].fetch_add(1, Relaxed);
+        let (dst, src) = (dst as usize, src as usize);
+        {
+            let mut pairs = PAIRS.lock().unwrap_or_else(|e| e.into_inner());
+            if pairs.len() < CAP {
+                pairs.push((dst, src));
+            } else {
+                MORE.fetch_add(1, Relaxed);
+            }
+        }
+        if !crate::capture::copies_logged(crate::queue::presented() + 1) {
+            return;
+        }
+        let presented = crate::queue::presented_resource();
+        tracing::info!(
+            frame = crate::queue::presented() + 1,
+            kind = KINDS[kind],
+            src = format_args!("{src:#x}"),
+            dst = format_args!("{dst:#x}"),
+            presented_last = format_args!("{presented:#x}"),
+            into_presented = presented != 0 && dst == presented,
+            "copy recorded"
+        );
+    }
+
+    /// A copy of kind `kind` was left out of the host lists, and why (the
+    /// first of each kind is named in the log).
+    pub(crate) fn skipped(kind: usize, why: &str) {
+        SKIPPED[kind].fetch_add(1, Relaxed);
+        if !SAID[kind].swap(true, Relaxed) {
+            tracing::warn!(
+                kind = KINDS[kind],
+                why,
+                "copy left out of the host lists (first of its kind)"
+            );
+        }
+    }
+
+    /// A texture-to-buffer copy (a readback) was recorded.
+    pub(crate) fn readback() {
+        READBACKS.fetch_add(1, Relaxed);
+    }
+
+    /// A buffer copy was recorded (title memory, copied at submission).
+    pub(crate) fn buffer() {
+        BUFFERS.fetch_add(1, Relaxed);
+    }
+
+    /// Takes the copies recorded since the last call.
+    pub(crate) fn take() -> Copies {
+        let mut copies = Copies::default();
+        for kind in 0..3 {
+            copies.attempts[kind] = ATTEMPTS[kind].swap(0, Relaxed);
+            copies.recorded[kind] = RECORDED[kind].swap(0, Relaxed);
+            copies.skipped[kind] = SKIPPED[kind].swap(0, Relaxed);
+        }
+        copies.readbacks = READBACKS.swap(0, Relaxed);
+        copies.buffers = BUFFERS.swap(0, Relaxed);
+        {
+            let mut pairs = PAIRS.lock().unwrap_or_else(|e| e.into_inner());
+            copies.pairs = std::mem::take(&mut *pairs);
+        }
+        copies.more = MORE.swap(0, Relaxed);
+        copies
+    }
+}
+
+/// The copies recorded since the last present (nothing without diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) use copies::Copies;
+/// The copies recorded since the last present (nothing without diagnostics).
+#[cfg(not(all(windows, feature = "diagnostics")))]
+#[derive(Default)]
+pub(crate) struct Copies;
+
+/// Takes the copies recorded since the last call.
+pub(crate) fn take_copies() -> Copies {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    {
+        copies::take()
+    }
+    #[cfg(not(all(windows, feature = "diagnostics")))]
+    {
+        Copies
+    }
+}
+
 /// Buffer to buffer: both are host memory, copied at submission.
 extern "system" fn copy_buffer_region(
     this: This,
@@ -643,6 +812,8 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
+        #[cfg(feature = "diagnostics")]
+        copies::buffer();
         list.defer_copy(to, from, len as usize);
         mark_work(this);
     }
@@ -653,7 +824,11 @@ extern "system" fn copy_buffer_region(
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
+        #[cfg(feature = "diagnostics")]
+        copies::attempt(copies::RESOURCE);
         let Some(list) = host_list(this) else {
+            #[cfg(feature = "diagnostics")]
+            copies::skipped(copies::RESOURCE, "not one of our lists");
             return;
         };
         if let (Some(to), Some(from)) = (
@@ -661,6 +836,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(src),
         ) {
             if mip_dropped(dst) || mip_dropped(src) {
+                #[cfg(feature = "diagnostics")]
+                copies::skipped(copies::RESOURCE, "a host texture lost mips");
                 return;
             }
             if crate::texture::title_written(from) {
@@ -675,9 +852,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.mark_work();
             #[cfg(feature = "diagnostics")]
             {
-                if crate::capture::listed(crate::queue::presented() + 1) {
-                    tracing::info!("copy resource {src:?} to {dst:?}");
-                }
+                copies::recorded(copies::RESOURCE, dst, src);
                 list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             }
             // SAFETY: an open list and live textures.
@@ -687,8 +862,16 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
+            #[cfg(feature = "diagnostics")]
+            copies::buffer();
             list.defer_copy(to, from, a.min(b) as usize);
             mark_work(this);
+        } else {
+            #[cfg(feature = "diagnostics")]
+            copies::skipped(
+                copies::RESOURCE,
+                "neither a host texture nor a title buffer",
+            );
         }
     }
     #[cfg(not(windows))]
@@ -726,12 +909,19 @@ extern "system" fn copy_texture_region(
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
         use windows::core::Interface;
         const FOOTPRINT: u32 = 1;
+        #[cfg(feature = "diagnostics")]
+        copies::attempt(copies::REGION);
         // SAFETY: the title passes both locations (null is tolerated).
         let (Some(list), Some(&dst), Some(&src)) =
             (host_list(this), unsafe { dst.as_ref() }, unsafe {
                 src.as_ref()
             })
         else {
+            #[cfg(feature = "diagnostics")]
+            copies::skipped(
+                copies::REGION,
+                "not one of our lists or an invalid location",
+            );
             return;
         };
         const _: () =
@@ -748,6 +938,8 @@ extern "system" fn copy_texture_region(
                 return;
             };
             if mip_dropped(src.resource) {
+                #[cfg(feature = "diagnostics")]
+                copies::skipped(copies::REGION, "a host texture lost mips (readback)");
                 return;
             }
             let Some((lines, row_bytes, total)) = dst.footprint.layout() else {
@@ -837,6 +1029,8 @@ extern "system" fn copy_texture_region(
                     host_box,
                 )
             };
+            #[cfg(feature = "diagnostics")]
+            copies::readback();
             list.defer_readback(
                 target,
                 staging,
@@ -850,9 +1044,13 @@ extern "system" fn copy_texture_region(
             return;
         }
         let Some(to) = crate::resource::host_resource(dst.resource) else {
+            #[cfg(feature = "diagnostics")]
+            copies::skipped(copies::REGION, "the destination has no host texture");
             return;
         };
         if mip_dropped(dst.resource) || (src.kind != FOOTPRINT && mip_dropped(src.resource)) {
+            #[cfg(feature = "diagnostics")]
+            copies::skipped(copies::REGION, "a host texture lost mips");
             return;
         }
         let mut from = src;
@@ -917,9 +1115,7 @@ extern "system" fn copy_texture_region(
                     (src.kind == FOOTPRINT).then_some(src.footprint)
                 )
             };
-            if crate::capture::listed(crate::queue::presented() + 1) {
-                tracing::info!("{}", text());
-            }
+            copies::recorded(copies::REGION, dst.resource, src.resource);
             match read {
                 Some(range) => list.note_read(text, range),
                 None => list.note_op(text),
@@ -965,14 +1161,26 @@ extern "system" fn resolve(
     src_sub: u32,
     format: u32,
 ) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    copies::attempt(copies::RESOLVE);
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
-        && let (Some(to), Some(from)) = (
+    {
+        let Some(list) = host_list(this) else {
+            #[cfg(feature = "diagnostics")]
+            copies::skipped(copies::RESOLVE, "not one of our lists");
+            return;
+        };
+        let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
-        )
-    {
+        ) else {
+            #[cfg(feature = "diagnostics")]
+            copies::skipped(copies::RESOLVE, "a resource has no host texture");
+            return;
+        };
         if mip_dropped(dst) || mip_dropped(src) {
+            #[cfg(feature = "diagnostics")]
+            copies::skipped(copies::RESOLVE, "a host texture lost mips");
             return;
         }
         use windows::Win32::Foundation::RECT;
@@ -991,9 +1199,7 @@ extern "system" fn resolve(
         list.mark_work();
         #[cfg(feature = "diagnostics")]
         {
-            if crate::capture::listed(crate::queue::presented() + 1) {
-                tracing::info!("resolve {src:?} to {dst:?} format {format}");
-            }
+            copies::recorded(copies::RESOLVE, dst, src);
             list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         }
         let extent = |d: D3D12_RESOURCE_DESC, subresource: u32| {
