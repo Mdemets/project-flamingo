@@ -810,7 +810,11 @@ fn module_of(address: usize) -> Option<String> {
     let len = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) };
     let path = String::from_utf16_lossy(&path[..len as usize]);
     let name = path.rsplit('\\').next().unwrap_or(&path);
-    Some(format!("{name}+{:#x}", address - module as usize))
+    Some(format!(
+        "{name}+{:#x} (module base {:#x})",
+        address - module as usize,
+        module as usize
+    ))
 }
 
 /// What is at `address`, for an access violation there: nothing, memory
