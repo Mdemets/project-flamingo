@@ -689,6 +689,7 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         // SAFETY: a live context; the probed pages are read only, and an
         // unreadable one is skipped by `bytes_at`.
         let probe = |at: u64, n: usize| -> String {
+            // SAFETY: read only, and an unreadable page gives None.
             unsafe { bytes_at(at as usize, n) }
                 .map(|b| {
                     b.iter()
@@ -873,7 +874,7 @@ fn module_of(address: usize) -> Option<String> {
 /// A read only.
 unsafe fn bytes_at(at: usize, n: usize) -> Option<&'static [u8]> {
     use windows_sys::Win32::System::Memory::{
-        PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+        PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
     };
     // SAFETY: reads the address space's bookkeeping, not `at` itself.
     let mut info: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION =
