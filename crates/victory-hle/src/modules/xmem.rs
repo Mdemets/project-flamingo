@@ -528,20 +528,20 @@ impl Physical {
             return;
         }
         let end = base + len;
-        // Join with the ranges that touch it, then insert the hull.
-        let first = self
-            .windows
-            .range(..base)
-            .next_back()
-            .filter(|(_, stop)| **stop >= base)
-            .map(|(start, _)| *start);
-        let start = first.unwrap_or(base);
-        let stop = self
-            .windows
-            .range(base..=end)
-            .next_back()
-            .map_or(end, |(_, stop)| (*stop).max(end));
-        self.windows.retain(|s, e| *s < start || *e > stop);
+        // Join with every range that touches it, then insert their hull. A
+        // range mapped inside a larger one must not shorten the larger one.
+        let (mut start, mut stop) = (base, end);
+        let mut joined = Vec::new();
+        for (&started, &stopped) in self.windows.range(..=end) {
+            if stopped >= start {
+                start = start.min(started);
+                stop = stop.max(stopped);
+                joined.push(started);
+            }
+        }
+        for started in joined {
+            self.windows.remove(&started);
+        }
         self.windows.insert(start, stop);
     }
 
@@ -1689,6 +1689,14 @@ mod tests {
         assert_eq!(p.windows.len(), 1);
         assert_eq!(p.windows.get(&0x1_0000), Some(&0x3_0000));
         assert!(!p.raced(0x3_0000));
+        // A range mapped inside a larger one leaves the larger one whole: the
+        // tail it does not reach is still a range a read may race.
+        let mut p = Physical::default();
+        p.note(0x1_0000, 0x4_0000);
+        p.note(0x2_0000, 0x1_0000);
+        assert_eq!(p.windows.len(), 1);
+        assert_eq!(p.windows.get(&0x1_0000), Some(&0x5_0000));
+        assert!(p.raced(0x4_8000));
     }
 
     fn query(address: *const c_void) -> BasicInformation {
