@@ -164,10 +164,9 @@ impl Shadow {
         let to = at.checked_add(n * 4)?;
         (to <= self.len as usize).then(|| {
             // SAFETY: inside the mapping, read only.
-            (unsafe { std::slice::from_raw_parts(self.data.add(at), n * 4) })
-                .chunks_exact(4)
-                .map(|w| u32::from_le_bytes(w.try_into().expect("four bytes")))
-                .collect()
+            let bytes = unsafe { std::slice::from_raw_parts(self.data.add(at), n * 4) };
+            let (words, _) = bytes.as_chunks::<4>();
+            words.iter().map(|w| u32::from_le_bytes(*w)).collect()
         })
     }
 

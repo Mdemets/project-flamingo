@@ -961,6 +961,7 @@ fn mapped_dump() {
         // SAFETY: a query of our own address space into `info`.
         info = unsafe { std::mem::zeroed() };
         let size = size_of::<MEMORY_BASIC_INFORMATION>();
+        // SAFETY: a query of our own address space into `info`.
         let n = unsafe { VirtualQuery(at as *const c_void, &mut info, size) };
         if n == 0 {
             break;
@@ -991,14 +992,13 @@ fn scratch_at(at: usize) -> Option<&'static str> {
         .range(..=at)
         .next_back()
         .is_some_and(|(base, len)| at < base + *len);
-    Some(if live { "live" } else { "freed" }).filter(|_| {
-        SCRATCH_EVER
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .range(..=at)
-            .next_back()
-            .is_some_and(|(base, len)| at < base + *len)
-    })
+    (SCRATCH_EVER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(..=at)
+        .next_back()
+        .is_some_and(|(base, len)| at < base + *len))
+    .then_some(if live { "live" } else { "freed" })
 }
 
 /// The pages behind bytes `[offset, offset + len)` of `pages` (64 KiB
@@ -1091,11 +1091,6 @@ impl PageWindow {
         ));
         result.map(drop)
     }
-
-    pub(crate) fn bytes(&mut self) -> &mut [u8] {
-        let (within, len) = (self.within, self.len);
-        &mut self.view.as_mut().expect("a window has a view").bytes()[within..within + len]
-    }
 }
 
 impl Drop for PageWindow {
@@ -1113,9 +1108,11 @@ impl Drop for PageWindow {
 /// request's window reused from the cache pays no map or unmap, and most
 /// requests read the same runs again. Capped: the oldest entry leaves
 /// when the 384th arrives.
-static SCRATCH_CACHE: LazyLock<
-    Mutex<std::collections::HashMap<(usize, usize, usize), (View, std::time::Instant)>>,
-> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+type ScratchKey = (usize, usize, usize);
+type ScratchCache = Mutex<std::collections::HashMap<ScratchKey, (View, std::time::Instant)>>;
+
+static SCRATCH_CACHE: LazyLock<ScratchCache> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 fn scratch_cache_put(key: (usize, usize, usize), view: View) {
     let mut cache = SCRATCH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
