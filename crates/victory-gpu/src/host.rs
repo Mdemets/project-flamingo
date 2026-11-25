@@ -634,6 +634,52 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
+/// The adapter's video-memory budget, usage and reservation, in MiB, as
+/// a log line: answers whether a Not enough memory (0x8007000E) refusal
+/// saw real VRAM pressure or the driver's compiler just bailing.
+pub(crate) fn budget_note(why: &str) {
+    let Some(host) = host() else { return };
+    // SAFETY: plain DXGI queries on the device's adapter.
+    let budget = unsafe {
+        let luid = host.device.GetAdapterLuid();
+        let factory: IDXGIFactory4 = match CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) {
+            Ok(factory) => factory,
+            Err(_) => return,
+        };
+        let mut index = 0u32;
+        let mut found = None;
+        while let Ok(adapter) = factory.EnumAdapters1(index) {
+            let desc = match adapter.GetDesc1() {
+                Ok(desc) => desc,
+                Err(_) => break,
+            };
+            if desc.AdapterLuid.LowPart == luid.LowPart
+                && desc.AdapterLuid.HighPart == luid.HighPart
+            {
+                found = adapter.cast::<IDXGIAdapter3>().ok();
+                break;
+            }
+            index += 1;
+        }
+        let Some(adapter) = found else { return };
+        let mut budget = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        if adapter
+            .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut budget)
+            .is_err()
+        {
+            return;
+        }
+        budget
+    };
+    tracing::warn!(
+        why,
+        budget = budget.Budget >> 20,
+        used = budget.CurrentUsage >> 20,
+        reserved = budget.CurrentReservation >> 20,
+        "adapter video memory at a refusal"
+    );
+}
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,

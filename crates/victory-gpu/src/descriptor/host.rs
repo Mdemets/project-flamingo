@@ -277,37 +277,40 @@ impl HostHeap {
             // shortcut: as below, descriptors past the limit are left out.
             tracing::warn!(count, "host view heap capped at {MAX_VIEWS}");
         }
-        let (heap, count) = match make(count_fitting + DYNAMIC) {
-            Ok(heap) => (heap, count_fitting),
-            Err(e) if count_fitting + DYNAMIC > PORTABLE_VIEWS => {
-                // shortcut: descriptors past the host's limit are left out;
-                // a title that reaches them needs remapping.
-                tracing::warn!(
-                    error = %e,
-                    count = count_fitting,
-                    "host view heap capped at {PORTABLE_VIEWS}"
-                );
-                // The driver refuses the largest legal heap too (one run
-                // answered 1_000_000 with The parameter is incorrect), so
-                // the heap shrinks until it is taken.
-                let mut fitting = PORTABLE_VIEWS;
-                let heap = loop {
-                    match make(fitting) {
-                        Ok(heap) => break heap,
-                        Err(e) => {
-                            if fitting <= DYNAMIC + (1 << 16) {
-                                tracing::warn!(error = %e, "no host descriptor heap");
-                                return None;
-                            }
-                            fitting = (fitting - (1 << 16)).max(DYNAMIC + (1 << 16));
-                        }
+        let (heap, count) = if count_fitting + DYNAMIC > PORTABLE_VIEWS {
+            // The first request is the largest legal shader-visible heap
+            // (the debug layer names the limit as 1,000,000), so it is
+            // made at that size first, and only shrinks if the driver
+            // refuses even that. Descriptors past the limit are left
+            // out; a title that reaches them needs remapping.
+            let mut fitting = PORTABLE_VIEWS;
+            let heap = loop {
+                match make(fitting) {
+                    Ok(heap) => {
+                        tracing::warn!(
+                            count = count_fitting,
+                            accepted = fitting,
+                            "host view heap capped"
+                        );
+                        break heap;
                     }
-                };
-                (heap, fitting - DYNAMIC)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                return None;
+                    Err(e) => {
+                        if fitting <= DYNAMIC + (1 << 16) {
+                            tracing::warn!(error = %e, "no host descriptor heap");
+                            return None;
+                        }
+                        fitting = (fitting - (1 << 16)).max(DYNAMIC + (1 << 16));
+                    }
+                }
+            };
+            (heap, fitting - DYNAMIC)
+        } else {
+            match make(count_fitting + DYNAMIC) {
+                Ok(heap) => (heap, count_fitting),
+                Err(e) => {
+                    tracing::warn!(error = %e, count = count_fitting, sampler, "no host descriptor heap");
+                    return None;
+                }
             }
         };
         Self::with(host, heap, kind, count, DYNAMIC)

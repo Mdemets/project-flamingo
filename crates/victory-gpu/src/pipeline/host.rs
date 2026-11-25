@@ -643,6 +643,7 @@ impl HostPipeline {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    crate::host::budget_note(&format!("compute {shaders:?}"));
                     host.log_messages();
                     return None;
                 }
@@ -681,6 +682,7 @@ impl HostPipeline {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    crate::host::budget_note(&format!("mesh {shaders:?}"));
                     host.log_messages();
                     return None;
                 }
