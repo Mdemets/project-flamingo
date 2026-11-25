@@ -70,6 +70,13 @@ const ADDRESS_32BIT: u64 = 4;
 /// The host's write watching (not in windows-sys' memory module).
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+/// The protection constants the rescue reads (windows-sys' memory module
+/// exports some of these elsewhere).
+const PAGE_GUARD: u32 = 0x100;
+const PAGE_READONLY: u32 = 2;
+const PAGE_WRITECOPY: u32 = 0x80;
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+
 /// The addresses XMem `flags` allow, first and last: the low 4 GiB for
 /// 32-bit memory; else from 4 GiB (kept for 32-bit requests, which the
 /// title's big pools would otherwise crowd out) up to 46 down to 40 bits
@@ -177,6 +184,22 @@ pub extern "system" fn XMemVirtualAlloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+    }
+    if !at.is_null() && constrained {
+        // A fresh reservation: the pool the title maps pages into, or heap
+        // the title has not committed yet. The console's address space is
+        // always readable, so a fault there (a read racing a map, or of a
+        // page never committed) is rescued instead of dying (see
+        // [`install_rescue`]).
+        physical().note(at as usize, size);
+        // A committed 32-bit graphics allocation joins the taken registry
+        // so its free (of the address alone) knows the size.
+        if !placeholder && flags & ADDRESS_32BIT != 0 && kind & MEM_COMMIT != 0 {
+            TAKEN_32BIT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(at as usize, round_32bit(size));
+        }
     }
     at
 }
@@ -291,9 +314,84 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
     }
 }
 
+/// 32-bit graphics blocks that were [`XMemFree`]d, base to size in bytes,
+/// all boundaries on [`PAGE`]. They stay committed and readable: the
+/// console's freed memory is readable until the allocator hands it out
+/// again, and a title that still reads through a freed pointer (Grand
+/// Theft Auto VI does, at world load) must not fault on us, let alone read
+/// some other mapping the host put at the freed address.
+static FREE_32BIT: LazyLock<Mutex<BTreeMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// 32-bit graphics blocks the title holds, base to size in bytes, so a
+/// free knows its size.
+static TAKEN_32BIT: LazyLock<Mutex<BTreeMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// Rounds a 32-bit allocation up to whole [`PAGE`]s, the granularity the
+/// blocks live at.
+fn round_32bit(size: usize) -> usize {
+    size.next_multiple_of(PAGE).max(PAGE)
+}
+
+/// Takes a freed 32-bit block that fits `size`, splitting the tail off
+/// into the free list; `None` if none fits and the caller asks the host.
+fn take_free_32bit(size: usize) -> Option<usize> {
+    let want = round_32bit(size);
+    let mut free = FREE_32BIT.lock().unwrap_or_else(|e| e.into_inner());
+    let (base, len) = free
+        .iter()
+        .find(|(_, len)| **len >= want)
+        .map(|(base, len)| (*base, *len))?;
+    free.remove(&base);
+    if len > want {
+        free.insert(base + want, len - want);
+    }
+    drop(free);
+    TAKEN_32BIT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(base, want);
+    Some(base)
+}
+
+/// A freed 32-bit block joins the free list, coalesced with its
+/// neighbours; it stays committed and readable.
+fn give_free_32bit(base: usize) {
+    let mut taken = TAKEN_32BIT.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(len) = taken.remove(&base) else {
+        // Not ours by address (a block of another granularity, or freed
+        // twice): keeping it readable is the safe answer either way.
+        tracing::warn!(
+            at = format_args!("{base:#x}"),
+            "a freed 32-bit allocation of no recorded size stays readable"
+        );
+        return;
+    };
+    drop(taken);
+    let mut free = FREE_32BIT.lock().unwrap_or_else(|e| e.into_inner());
+    // The neighbour below, if it ends where this block starts.
+    let left = free
+        .range(..base)
+        .next_back()
+        .filter(|(s, e)| *s + *e == base)
+        .map(|(s, _)| *s);
+    let start = if let Some(s) = left {
+        free.remove(&s);
+        s
+    } else {
+        base
+    };
+    let end = base + len + free.remove(&(base + len)).unwrap_or(0);
+    free.insert(start, end - start);
+}
+
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
     if attributes & ALLOC_32BIT != 0 {
+        if let Some(block) = take_free_32bit(size) {
+            return (block as *mut u8).cast();
+        }
         return XMemVirtualAlloc(
             std::ptr::null_mut(),
             size,
@@ -335,7 +433,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            give_free_32bit(address as usize);
             return;
         }
         let user = address.cast::<u8>();
@@ -521,18 +619,133 @@ fn install_rescue() {
         // Without the lock: a write over the map is brief and does not wait
         // on this thread, so a read never deadlocks, and our own mapping code
         // never reads the pages it maps.
+        let kind = r.ExceptionInformation[0] as u32;
+        // Any access into memory that admits it can race a host remap or
+        // guard: the console's memory is always readable, so the fault is
+        // transient. A page that already admits the access gets the
+        // instruction retried at once; a page not committed yet waits for
+        // its mapping briefly. A committed page that refuses the access is
+        // a real fault (a wild pointer, a write to read-only code) and
+        // dies as it should.
+        let admits = |protect: u32, kind: u32| {
+            let readable = protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY) != 0;
+            let writable = protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE) != 0;
+            kind == 0 && readable || kind == 1 && writable
+        };
+        // SAFETY: plain data; zero is a valid value.
+        let mut page: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let size = size_of::<MEMORY_BASIC_INFORMATION>();
+        // SAFETY: a query of our own address space into `page`.
+        unsafe { VirtualQuery(at as *const c_void, &mut page, size) };
+        if page.Protect & PAGE_GUARD == 0
+            && page.State == MEM_COMMIT
+            && admits(page.Protect, kind)
+        {
+            static RESCUED: AtomicUsize = AtomicUsize::new(0);
+            let n = RESCUED.fetch_add(1, Ordering::Relaxed);
+            if n < 8 || n.is_power_of_two() {
+                tracing::debug!(
+                    at = format_args!("{at:#x}"),
+                    kind = kind,
+                    rescued = n,
+                    "an access racing a mapping waited for the page"
+                );
+            }
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if page.Protect & PAGE_GUARD == 0 && page.State != MEM_COMMIT && kind != 1 {
+            // Not committed yet: the console shows stale memory there. Wait
+            // for the mapping to return, then show it.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_micros(50));
+                // SAFETY: a query of our own address space into `page`.
+                unsafe { VirtualQuery(at as *const c_void, &mut page, size) };
+                if page.Protect & PAGE_GUARD == 0
+                    && page.State == MEM_COMMIT
+                    && admits(page.Protect, kind)
+                {
+                    static WAITED: AtomicUsize = AtomicUsize::new(0);
+                    let n = WAITED.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 || n.is_power_of_two() {
+                        tracing::debug!(
+                            at = format_args!("{at:#x}"),
+                            waited = n,
+                            "a read racing a remap waited for the mapping"
+                        );
+                    }
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+        }
         if !physical().raced(at) {
+            static MISSED: AtomicUsize = AtomicUsize::new(0);
+            let n = MISSED.fetch_add(1, Ordering::Relaxed);
+            if n < 8 || n.is_power_of_two() {
+                // SAFETY: plain data; zero is a valid value.
+                let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                let size = size_of::<MEMORY_BASIC_INFORMATION>();
+                // SAFETY: a query of our own address space into `info`.
+                unsafe { VirtualQuery(at as *const c_void, &mut info, size) };
+                tracing::debug!(
+                    at = format_args!("{at:#x}"),
+                    kind = r.ExceptionInformation[0],
+                    state = format_args!("{:#x}", info.State),
+                    protect = format_args!("{:#x}", info.Protect),
+                    type_ = format_args!("{:#x}", info.Type),
+                    allocation = format_args!("{:#x}", info.AllocationBase as usize),
+                    region = info.RegionSize,
+                    scratch = scratch_at(at).unwrap_or("no"),
+                    "a fault outside the mapped windows"
+                );
+                if n == 1 {
+                    mapped_dump();
+                }
+            }
             return EXCEPTION_CONTINUE_SEARCH;
         }
+        static RESCUED: AtomicUsize = AtomicUsize::new(0);
+        static ZEROED: AtomicUsize = AtomicUsize::new(0);
+        static STUCK: AtomicUsize = AtomicUsize::new(0);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         loop {
-            if committed(at) {
+            if readable(at, 64) {
+                let n = RESCUED.fetch_add(1, Ordering::Relaxed);
+                if n < 8 || n.is_power_of_two() {
+                    tracing::debug!(
+                        at = format_args!("{at:#x}"),
+                        rescued = n,
+                        "a read racing a remap waited for the mapping"
+                    );
+                }
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
-            if std::time::Instant::now() >= deadline {
-                return EXCEPTION_CONTINUE_SEARCH;
+            if std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_micros(50));
+                continue;
             }
-            std::thread::sleep(std::time::Duration::from_micros(50));
+            // A page the title never mapped (the console shows stale memory
+            // there, never a fault): show it zeros, as an idle console's
+            // physical memory reads.
+            if zero_commit(at) {
+                let n = ZEROED.fetch_add(1, Ordering::Relaxed);
+                if n < 8 || n.is_power_of_two() {
+                    tracing::debug!(
+                        at = format_args!("{at:#x}"),
+                        zeroed = n,
+                        "a never-mapped pool page reads zeros"
+                    );
+                }
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            let n = STUCK.fetch_add(1, Ordering::Relaxed);
+            if n < 8 || n.is_power_of_two() {
+                tracing::warn!(
+                    at = format_args!("{at:#x}"),
+                    "a mapped page did not come back; the fault stands"
+                );
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
         }
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -542,18 +755,29 @@ fn install_rescue() {
     });
 }
 
-/// Whether `at` is committed readable memory now.
-fn committed(at: usize) -> bool {
+/// Whether `[at, at + len)` is committed readable memory now: an access can
+/// run from one page into the next, and the next page is the one the remap
+/// took down.
+fn readable(at: usize, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READONLY, VirtualQuery,
+        MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READONLY, VirtualQuery,
     };
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0
-        && info.State == MEM_COMMIT
-        && !matches!(info.Protect & 0xff, PAGE_NOACCESS | PAGE_READONLY)
+    let mut at = at;
+    let end = at.saturating_add(len);
+    while at < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if n == 0
+            || info.State != windows_sys::Win32::System::Memory::MEM_COMMIT
+            || matches!(info.Protect & 0xff, PAGE_NOACCESS | PAGE_READONLY)
+        {
+            return false;
+        }
+        at = (info.BaseAddress as usize) + info.RegionSize;
+    }
+    true
 }
 
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
@@ -655,6 +879,7 @@ impl View {
         if at.Value.is_null() {
             return None;
         }
+        scratch_note(at.Value as usize, len, true);
         let view = View { at, len };
         commit(at.Value as usize, len).then_some(view)
     }
@@ -672,7 +897,96 @@ impl Drop for View {
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(self.at) };
+        scratch_note(self.at.Value as usize, self.len, false);
     }
+}
+
+/// Scratch views at OS-chosen addresses, live ones only, base to size.
+static SCRATCH_LIVE: LazyLock<Mutex<BTreeMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// Scratch views ever mapped, base to size, so a fault in a freed one
+/// still names its kind. Kept small: the oldest entry leaves when the
+/// eighth thousand arrives.
+static SCRATCH_EVER: LazyLock<Mutex<BTreeMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// Notes a scratch view's lifetime, `live` on map, freed on drop.
+fn scratch_note(at: usize, len: usize, live: bool) {
+    if live {
+        SCRATCH_LIVE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(at, len);
+    } else {
+        SCRATCH_LIVE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&at);
+    }
+    let mut ever = SCRATCH_EVER.lock().unwrap_or_else(|e| e.into_inner());
+    ever.insert(at, len);
+    if ever.len() > 8192 {
+        let oldest = *ever.keys().next().expect("non-empty");
+        ever.remove(&oldest);
+    }
+}
+
+/// A one-shot walk of every mapping, for a fault outside the windows:
+/// the mapped views of the process, each as base..end, so the faulting
+/// address's owner can be identified from the log.
+fn mapped_dump() {
+    use windows_sys::Win32::System::Memory::VirtualQuery;
+    let mut info: MEMORY_BASIC_INFORMATION;
+    let mut at = 0x10000usize;
+    let mut lines = Vec::new();
+    while at < 0x7ffffffeffff {
+        // SAFETY: a query of our own address space into `info`.
+        info = unsafe { std::mem::zeroed() };
+        let size = size_of::<MEMORY_BASIC_INFORMATION>();
+        let n = unsafe { VirtualQuery(at as *const c_void, &mut info, size) };
+        if n == 0 {
+            break;
+        }
+        let end = info.BaseAddress as usize + info.RegionSize;
+        if info.Type == windows_sys::Win32::System::Memory::MEM_MAPPED
+            && (info.State == MEM_COMMIT || info.State == MEM_RESERVE)
+        {
+            lines.push(format!(
+                "    {:#x}-{:#x} state {:#x} protect {:#x} size {:#x}",
+                info.BaseAddress as usize,
+                end,
+                info.State,
+                info.Protect,
+                info.RegionSize
+            ));
+        }
+        at = end.max(at + PAGE);
+    }
+    tracing::debug!(n = lines.len(), "mapped views of the process:\n{}", lines.join("\n"));
+}
+
+/// What a scratch view says about `at`: none, live, or freed.
+fn scratch_at(at: usize) -> Option<&'static str> {
+    let live = SCRATCH_LIVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(..=at)
+        .next_back()
+        .is_some_and(|(base, len)| at < base + *len);
+    Some(if live {
+        "live"
+    } else {
+        "freed"
+    })
+    .filter(|_| {
+        SCRATCH_EVER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .range(..=at)
+            .next_back()
+            .is_some_and(|(base, len)| at < base + *len)
+    })
 }
 
 /// The pages behind bytes `[offset, offset + len)` of `pages` (64 KiB
@@ -1020,6 +1334,96 @@ fn placeholder(at: usize) -> Option<(usize, usize)> {
             info.BaseAddress as usize + info.RegionSize,
         )
     })
+}
+
+/// Zero sections, and how much of the last one views already show.
+static ZEROS: LazyLock<Mutex<(Vec<Arc<Section>>, usize)>> =
+    LazyLock::new(|| Mutex::new((Vec::new(), 0)));
+
+/// One zero section's size (committed only where views map it).
+const ZERO_SECTION: usize = 64 << 20;
+
+/// Commits the placeholder `at` faults in with zeros, so a read of a page
+/// the title never mapped returns something instead of dying (the console's
+/// physical memory is always readable, and an idle console's reads zeros).
+/// Records the view, so the title's own mapping of the page replaces it
+/// later. False if `at` is not a placeholder or the host fails.
+fn zero_commit(at: usize) -> bool {
+    // The faulting page's placeholder piece: a reservation the title never
+    // split is one region of many GiB, and a view would commit all of it,
+    // so cut the page out first (mapping does the same to its own bounds).
+    let page = at & !(PAGE - 1);
+    if placeholder(page).is_none() || page.checked_add(PAGE).is_none() {
+        return false;
+    }
+    split_at(page);
+    split_at(page + PAGE);
+    let (start, region_end) = {
+        // SAFETY: plain data; zero is a valid value.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let size = size_of::<MEMORY_BASIC_INFORMATION>();
+        // SAFETY: a query of our own address space into `info`.
+        let found = unsafe { VirtualQuery(page as *const c_void, &mut info, size) } == size;
+        if !found || info.State != MEM_RESERVE || info.Type != MEM_PRIVATE {
+            return false;
+        }
+        (
+            info.BaseAddress as usize,
+            info.BaseAddress as usize + info.RegionSize,
+        )
+    };
+    let len = region_end - start;
+    if len != PAGE || start != page {
+        return false;
+    }
+    // A zero section big enough that this view shows fresh zeros, not
+    // another view's writes.
+    let mut zeros = ZEROS.lock().unwrap_or_else(|e| e.into_inner());
+    let (sections, used) = &mut *zeros;
+    if sections.is_empty() || *used + len > ZERO_SECTION {
+        // SAFETY: a pagefile section; its views commit what they show.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_COMMIT,
+                (ZERO_SECTION >> 32) as u32,
+                ZERO_SECTION as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            return false;
+        }
+        sections.push(Arc::new(Section(handle)));
+        *used = 0;
+    }
+    let section = sections.last().unwrap().clone();
+    let index = *used / PAGE;
+    *used += len;
+    drop(zeros);
+    let slice = Slice { section, index };
+    // SAFETY: replaces the placeholder with a committed zero view; the host
+    // refuses anything that is not that placeholder.
+    let view = unsafe {
+        MapViewOfFile3(
+            slice.section.0,
+            GetCurrentProcess(),
+            start as *const c_void,
+            (slice.index * PAGE) as u64,
+            len,
+            MEM_REPLACE_PLACEHOLDER,
+            PAGE_READWRITE,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if view.Value as usize != start {
+        return false;
+    }
+    let mut physical = physical();
+    physical.views.insert(start, (len, slice));
+    true
 }
 
 /// Splits the placeholder holding `at` in two there, if it starts below.
