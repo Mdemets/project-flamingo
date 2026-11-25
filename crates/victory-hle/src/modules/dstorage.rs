@@ -486,6 +486,18 @@ fn work(scheduler: &'static Scheduler) {
         let failure = execute(&job.request)
             .err()
             .map(|hr| Box::new(ReadFailure::new(&job.request, hr)));
+        // A request that takes seconds at world load is what the title's
+        // prestream watchdog outlives: name it.
+        let took = started.elapsed();
+        if took.as_secs_f64() > 1.0 {
+            tracing::warn!(
+                s = took.as_secs_f64(),
+                size = job.request.destination_size,
+                offset = job.request.offset,
+                name = text(job.request.name),
+                "dstorage: a request took seconds"
+            );
+        }
         lanes = scheduler.lock();
         lanes.finish(&job, failure);
         lanes.count(&job, started);
