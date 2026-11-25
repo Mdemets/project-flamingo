@@ -195,7 +195,7 @@ fn excluded_names(value: &str) -> HashSet<String> {
 pub(crate) fn pipeline(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
-    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+    mut create: impl FnMut() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     #[cfg(feature = "diagnostics")]
     {
@@ -258,7 +258,24 @@ pub(crate) fn pipeline(
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     // Compiled outside the library lock: compiles take up to seconds.
-    let made = create();
+    let made = {
+        // Not enough memory is a peak during one huge compile, not a
+        // permanent verdict: the driver holds the compiler's intermediates
+        // and answers 0x8007000E although the adapter has room. One more
+        // attempt a moment later costs less than a pass lost for the run.
+        let first = create();
+        match first {
+            Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let second = create();
+                if second.is_ok() {
+                    tracing::info!(name, "host pipeline made on a second attempt");
+                }
+                second
+            }
+            other => other,
+        }
+    };
     if made.is_err() {
         cool.lock()
             .unwrap_or_else(|e| e.into_inner())

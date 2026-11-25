@@ -158,7 +158,9 @@ impl Shadow {
     }
 
     /// The `n` little-endian dwords at a title address inside the buffer,
-    /// from the host copy as it stands now.
+    /// from the host copy as it stands now. Only the diagnostics reports
+    /// read them.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     pub(crate) fn u32s(&self, address: u64, n: usize) -> Option<Vec<u32>> {
         let at = self.offset(address) as usize;
         let to = at.checked_add(n * 4)?;
